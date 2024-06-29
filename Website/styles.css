@@ -1,0 +1,41 @@
+
+body {
+    /* background-color: rgb(223, 223, 223); */
+    background-image: linear-gradient(to bottom right, ivory, silver, gray, slategray);
+    background-repeat: no-repeat;
+    background-size: auto;
+}
+h1 {
+    font-family: 'Times New Roman', Times, serif;
+    /* padding: 10px; */
+    padding-left:10px;
+    
+}
+p {
+    font-family: 'Trebuchet MS';
+    margin: 8px 20px;
+}
+.list {
+    font-family :'Trebuchet MS';
+    /* padding: left 10px; */
+
+}
+#grpMem {
+    margin: 10px 10px 10px 10px;
+    text-align: center;
+    font-size: 20px
+}
+#sponsor {
+    margin: 10px 10px 5px 10px;
+    text-align: center;
+}
+#reviewers {
+    margin: 5px 10px 10px 10px;
+    text-align: center;
+
+}
+#nameDiv {
+    border: solid;
+    border-width: 0px 0px 3px;
+
+}
