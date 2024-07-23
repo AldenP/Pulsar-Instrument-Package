@@ -40,15 +40,16 @@ p {
 
 }
 .navBar {
-    margin: 10px;
+    margin: 5px;
     padding: 5px;
     border-style: groove; 
-    border-width: 2px;
+    border-width: 3px;
 }
 #teamPage {
-    padding: 5px;
-    border-style: groove;
-    border-width: 2px;
+    padding: 1px;
+    border-style: inset;
+    border-width: 3px;
+    border-color: silver;
 }
 .aboutList {
     padding: 3px 0px;
@@ -63,4 +64,21 @@ p {
     /* text-align: center; */
     padding: 5px;
 
+}
+#div_120 {
+    margin-left:5px;
+    /* justify-content: center;
+    align-content: center; */
+    border-top-style: double;
+
+}
+#demoVideo {
+    /* margin: auto; */
+    margin-left: 10%;
+    margin-right: 20%;
+    padding: 3px;
+    
+    text-align: center;
+    border-style: groove;
+    border-color: black; 
 }

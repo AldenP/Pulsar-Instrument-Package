@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 
 # assume a method for importing the data from a .FITS format already exists.
 
+#Intensity does not need to be normalized; Q and U will need to be normalized to find the polarization angle. 
 def findParam_I(d_0, d_90):
     """ Find the Stokes' Parameter I (intensity) by summing the squares of 2 orthogonal polarizations.
         d_0 - the data for the 0deg detector
@@ -48,8 +49,10 @@ def findPolarizationAngle(Q_norm, U_norm):
         Q_norm: Q-parameter normalized
         U_norm: U-parameter normalized
     """
+    #1/2 arctan(U/Q) - when normalized (irrelavent actually).
     return NotImplementedError('PolarizationAngle not yet implemented')
 
+# normalized parameters to find the degree of linear polarization sqrt(Q^2 + U^2)/I 
 
 def main() -> None:
     pass
