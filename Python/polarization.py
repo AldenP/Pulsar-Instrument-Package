@@ -6,16 +6,17 @@ import matplotlib.pyplot as plt
 
 # assume a method for importing the data from a .FITS format already exists.
 
+#Intensity does not need to be normalized; Q and U will need to be normalized to find the polarization angle. 
 def findParam_I(d_0, d_90):
     """ Find the Stokes' Parameter I (intensity) by summing the squares of 2 orthogonal polarizations.
         d_0 - the data for the 0deg detector
         d_90 - the data for the 90deg detector
         Future note: make sure dimensions of arrays are good. 
     """
-    # raw intensity = (d_0)^2 + (d_90)^2
-    #np.square will square element-by-element and remain an array
-    #np.add adds two arrays
-    I_raw = np.add( np.square(d_0), np.square(d_90) )
+    # raw intensity = (d_0) + (d_90)
+    # -> data is power from detector
+    # np.add adds two arrays
+    I_raw = np.add( d_0, d_90 )
     
     # To normalize the data, find the max and divide all elements by it
     I_max = np.amax(I_raw, axis=0)  # axis may need to change, depending on future implemtation
@@ -29,7 +30,7 @@ def findParam_Q(d_0, d_90):
         Future note: make sure dimensions of arrays are good. 
     """
     # Q = (d_0)^2 - (d_90)^2
-    Q_raw = np.subtract( np.square(d_0), np.square(d_90) ) 
+    Q_raw = np.subtract( d_0, d_90 ) 
     # now Q needs to be normalized ... 
     # does this require using the normalized Intensity, or should d_0, d_90 be normalized first? 
 
@@ -40,7 +41,7 @@ def findParam_U(d_45, d_135):
         Future note: make sure dimensions of arrays are good. 
     """
     # U = (d_45)^2 - (d_135)^2
-    U_raw = np.subtract( np.square(d_45), np.square(d_135) )
+    U_raw = np.subtract( d_45, d_135 )
     # again, U must be normalized.
 
 def findPolarizationAngle(Q_norm, U_norm):
@@ -48,8 +49,10 @@ def findPolarizationAngle(Q_norm, U_norm):
         Q_norm: Q-parameter normalized
         U_norm: U-parameter normalized
     """
+    #1/2 arctan(U/Q) - when normalized (irrelavent actually).
     return NotImplementedError('PolarizationAngle not yet implemented')
 
+# normalized parameters to find the degree of linear polarization sqrt(Q^2 + U^2)/I 
 
 def main() -> None:
     pass
