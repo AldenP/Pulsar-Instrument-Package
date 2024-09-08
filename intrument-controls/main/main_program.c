@@ -72,7 +72,7 @@ typedef struct handlers_t {
     // gptimer_handle_t *gptimer;
 } my_handlers_t;
 
-static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data)
+static bool IRAM_ATTR adc_conv_ready_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data)
 {
     BaseType_t mustYield = pdFALSE;
     //Notify that ADC continuous driver has done enough number of conversions
@@ -86,8 +86,8 @@ static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc
     adc_continuous_handle_t handle = NULL;
 
     adc_continuous_handle_cfg_t adc_config = {
-        .max_store_buf_size = 8 * EXAMPLE_READ_LEN,
-        .conv_frame_size = EXAMPLE_READ_LEN,
+        .max_store_buf_size = 8 * ADC_BUFFER_LEN,
+        .conv_frame_size = ADC_BUFFER_LEN,
     };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &handle));
 
@@ -133,7 +133,7 @@ static void IRAM_ATTR start_isr_handler(void* arg) {
         ESP_ERROR_CHECK(adc_continuous_start(*adc_handle)); //error here: abort from lock_acquire_generic
         adc_state = true;
         taskEXIT_CRITICAL_ISR(&adc_lock);
-
+        xTaskResumeFromISR(adc_print_handle);
         // if (ret != ESP_OK) {
         //     // do something? - can't print in ISR!
         //     // return ret;  //void type
@@ -177,8 +177,8 @@ static void adc_print_task(void* args) {
 
     esp_err_t ret;
     uint32_t ret_num = 0;
-    uint8_t result[EXAMPLE_READ_LEN] = {0};
-    memset(result, 0xcc, EXAMPLE_READ_LEN);
+    uint8_t result[ADC_BUFFER_LEN] = {0};
+    memset(result, 0xcc, ADC_BUFFER_LEN);
     ESP_LOGI(ADC_PRINT_TAG, "adc_print_task created and waiting.");
     while (1) {
 
@@ -195,7 +195,7 @@ static void adc_print_task(void* args) {
         char unit[] = EXAMPLE_ADC_UNIT_STR(EXAMPLE_ADC_UNIT);
 
         while (1) {
-            ret = adc_continuous_read(adc_handle, result, EXAMPLE_READ_LEN, &ret_num, 0);
+            ret = adc_continuous_read(adc_handle, result, ADC_BUFFER_LEN, &ret_num, 0);
             if (ret == ESP_OK) {
                 ESP_LOGI("TASK", "ret is %x, ret_num is %"PRIu32" bytes", ret, ret_num);
                 for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
@@ -234,6 +234,7 @@ static void adc_print_task(void* args) {
             }
             else {
                 ESP_LOGW(ADC_PRINT_TAG, "bad ret value %d", ret);
+                vTaskSuspend(adc_print_handle);
                 break;
             }
         }
@@ -276,7 +277,7 @@ void app_main(void)
     continuous_adc_init(channel, sizeof(channel) / sizeof(adc_channel_t), &handle);
 
     adc_continuous_evt_cbs_t cbs = {
-        .on_conv_done = s_conv_done_cb,
+        .on_conv_done = adc_conv_ready_cb,
     };
     ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(handle, &cbs, NULL));
     // ESP_ERROR_CHECK(adc_continuous_start(handle));
@@ -290,6 +291,7 @@ void app_main(void)
 
     // register a task
     xTaskCreate(adc_print_task, "ADC-PRINT", TASK_STACK_SIZE, (void*)&handles, tskIDLE_PRIORITY, (void*) &adc_print_handle);
+    
     ESP_ERROR_CHECK(adc_continuous_start(handle));  //start the adc conversions
     adc_state = true;
 
