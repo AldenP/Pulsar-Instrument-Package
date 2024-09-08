@@ -1,0 +1,15 @@
+dependencies:
+  idf:
+    component_hash: null
+    source:
+      type: idf
+    version: 5.2.2
+  zorxx/lcd1602:
+    component_hash: 7e2b69e5cfcbbe6ace6a22e5884359a0ebefa7b3431f1847c0830f9c0ae6edb0
+    source:
+      service_url: https://api.components.espressif.com/
+      type: service
+    version: 1.2.0
+manifest_hash: 81738f99455fe037ffcc5f40de98a0cb7244fb18219694d7e74d810ac4693e23
+target: esp32
+version: 1.0.0
