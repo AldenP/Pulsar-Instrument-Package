@@ -16,6 +16,8 @@
     "idf.flashType": "UART",
     "idf.portWin": "COM3",
     "files.associations": {
-        "gpio.h": "c"
+        "gpio.h": "c",
+        "mcpwm.h": "c",
+        "pcnt.h": "c"
     }
 }
