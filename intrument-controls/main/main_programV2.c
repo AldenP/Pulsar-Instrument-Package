@@ -10,7 +10,6 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 // includes for this project
 #include "esp_adc/adc_continuous.h"     // for ADC in continuous mode
 #include "driver/gpio.h"                // for gpio's
@@ -45,8 +44,8 @@
 #define SD_CLK          GPIO_NUM_14     // white wire
 #define SD_DETECT       GPIO_NUM_23     // gray wire    - when high, SD card is inserted. Hardwire an LED. 
 // --- Data Lines ---
-#define SD_DAT0         GPIO_NUM_4      // blue wire
-#define SD_DAT1         GPIO_NUM_2      // green wire
+#define SD_DAT0         GPIO_NUM_2      // blue wire
+#define SD_DAT1         GPIO_NUM_4      // green wire
 #define SD_DAT2         GPIO_NUM_12     // yellow wire
 #define SD_DAT3         GPIO_NUM_13     // orange wire
 
@@ -362,6 +361,9 @@ static void adc_task(void* args) {
         blue_led_state = 0;
 
         // FUTURE: start waveplate. Abort if status not OKAY
+        // assume that the waveplate has been pre-configured
+        // send "fw" to run waveplate continuously
+
         // give a 3 second countdown. 
         for (int16_t i = 3; i >= 1; i--) {
             ESP_LOGI(ADC_TASK_TAG, "Starting ADC...(%"PRId16")", i);
@@ -382,6 +384,8 @@ static void adc_task(void* args) {
         // inform python that this sampling period has ended
         printf("%s\n", PY_END_TAG);
         // FUTURE: stop waveplate
+        // send "st" to stop waveplate rotation. Is there a reason to reverse ("bw") back to home? 
+
         ESP_ERROR_CHECK(adc_continuous_deinit(*adc_handle));
         ESP_LOGI(ADC_TASK_TAG, "ADC deinitialized.");
         *adc_handle = NULL; //reset back to null
@@ -591,7 +595,8 @@ void app_main(void) {
     #pragma endregion
     // --- Waveplate UART ---
     // use functions defined in rotator_driver.h
-
+    // set velocity ("sv") to 50-70% of max. so 0x32 to 0x48 would be sent as ASCII ('3' + '2', etc. )
+    // set jog step size to 0 for continuous ("sj")
     // // --- I2C LCD ---
     #pragma region 
     ESP_LOGI(MAIN_TAG, "Setting up I2C bus for LCD");

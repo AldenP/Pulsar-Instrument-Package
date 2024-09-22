@@ -13,7 +13,8 @@
 // Pins for the rotator mount
 #define ROTATOR_TX      GPIO_NUM_21
 #define ROTATOR_RX      GPIO_NUM_22
-#define ROTATOR_BAUD    9600
+#define ROTATOR_BAUD    9600        // baud rate is fixed at 9600
+#define ROTATOR_ADDR    '0'         // default address of devices
 
 // UART port/controller number 
 const uart_port_t rotator_uart_num = UART_NUM_1;
