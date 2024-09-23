@@ -33,6 +33,7 @@ def findParam_Q(d_0, d_90):
     Q_raw = np.subtract( d_0, d_90 ) 
     # now Q needs to be normalized ... 
     # does this require using the normalized Intensity, or should d_0, d_90 be normalized first? 
+    return Q_raw
 
 def findParam_U(d_45, d_135):
     """ Find the Stokes' Parameter U (polarization term 2) by taking the difference of the squares of 2 different orthogonal polarizations.
@@ -43,17 +44,23 @@ def findParam_U(d_45, d_135):
     # U = (d_45)^2 - (d_135)^2
     U_raw = np.subtract( d_45, d_135 )
     # again, U must be normalized.
+    return U_raw
 
-def findPolarizationAngle(Q_norm, U_norm):
+def findPolarizationAngle(Q, U):
     """ Finds the polarization angle, knowing the Q, and U parameter (normalized)
         Q_norm: Q-parameter normalized
         U_norm: U-parameter normalized
     """
     #1/2 arctan(U/Q) - when normalized (irrelavent actually).
-    return NotImplementedError('PolarizationAngle not yet implemented')
+    return 0.5 * np.arctan2(Q, U)
 
 # normalized parameters to find the degree of linear polarization sqrt(Q^2 + U^2)/I 
-
+def findDoL(I_norm, Q_norm, U_norm):
+    """ Finds the Degree of Linear Polarization (DOL, or DoL here).
+        DOL = sqrt(Q^2 + U^2) /I
+        Requires Q and U to be normalized, and presumably I as well.
+    """
+    return  np.divide( np.sqrt( np.square(Q_norm) + np.square(U_norm)), I_norm)
 def main() -> None:
     pass
 
