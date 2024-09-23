@@ -1,0 +1,15 @@
+dependencies:
+  idf:
+    component_hash: null
+    source:
+      type: idf
+    version: 5.2.2
+  zorxx/lcd1602:
+    component_hash: null
+    source:
+      path: C:\Users\alden\Desktop\PythonCode\Pulsar-Instrument-Package\intrument-controls\components\zorxx__lcd1602
+      type: local
+    version: 1.2.0
+manifest_hash: 6a1a0d50db1804e92a265cda24b8247f35ed451dbc5d9169e5ca9ac3615fc9a9
+target: esp32
+version: 1.0.0
