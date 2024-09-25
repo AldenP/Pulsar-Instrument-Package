@@ -2,7 +2,7 @@
 # David Patenaude - 7.15.2024
 # Senior Design Summer '24 - Fall '24 Group 3
 
-import serial
+import serial   # import is from pySerial. make sure that is what is installed using pip.
 import os
 import time
 import numpy as np
@@ -11,16 +11,21 @@ from array import array
 
 # Configure the serial port
 serial_port = 'COM3'  # Change this to your serial port
-baud_rate = 1000000      #this can be increased by updating menuconfig UART setup for esp32 chip
+baud_rate = 2000000      #this can be increased by updating menuconfig UART setup for esp32 chip
 num_samples = 8*1024      # this should match the ADC_BUFFER_LEN from ESP32 code. Currently 8KB
 
 BEGIN_TAG = b"BEGIN PY READ"    # 'b' is to interpret as binary
 PY_END_TAG = b"END PY SAMPLE"
+META_TAG = b"PY METADATA"       # used to send meta data information
+
 VMAX = 960  #mV // max when using 0 attenuations
 DMAX = pow(2, 12) #12 bit resolution
 DEFAULT_DIR = "./adc_data/"
 
 ser = serial.Serial(serial_port, baud_rate, timeout=5)  #5 second timeout on reads
+
+sample_freq = 0
+sample_dur = 250
 
 def read_adc_data():
     print("PY > Reading ADC Data\n")
@@ -49,16 +54,16 @@ def read_adc_data():
     
     return adc_raw
 
-def calculate_pulse_timing(adc_data, sampling_rate):
-    # Smooth the ADC data using Savitzky-Golay filter
-    smoothed_data = savgol_filter(adc_data, window_length=51, polyorder=3)
-    # Compute the first derivative
-    derivative = np.diff(smoothed_data)
-    # Identify the positions of maxima
-    maxima = (np.diff(np.sign(np.diff(derivative))) < 0).nonzero()[0] + 1
-    # Calculate pulse intervals
-    pulse_intervals = np.diff(maxima) / sampling_rate
-    return pulse_intervals
+# def calculate_pulse_timing(adc_data, sampling_rate):
+#     # Smooth the ADC data using Savitzky-Golay filter
+#     smoothed_data = savgol_filter(adc_data, window_length=51, polyorder=3)
+#     # Compute the first derivative
+#     derivative = np.diff(smoothed_data)
+#     # Identify the positions of maxima
+#     maxima = (np.diff(np.sign(np.diff(derivative))) < 0).nonzero()[0] + 1
+#     # Calculate pulse intervals
+#     pulse_intervals = np.diff(maxima) / sampling_rate
+#     return pulse_intervals
 
 timeoutCount = 0
 adc_data = list()   # holds dictionaries of the ADC data.
@@ -73,6 +78,13 @@ while True:
     if dataIn == b'':
         print('Py > Timed Out with no new data (%d)\n', timeoutCount)  #print to console if timed out
         timeoutCount +=1
+
+    if dataIn.strip() == META_TAG:
+        # get metadata from serial/ESP32: printf("%s | freq: %"PRIu32"; duration: %"PRIu32"", PY_DATA, sample_frequency, sample_duration);   //in Hz and ms
+        line = dataIn.split("|")[1].split(";")
+        sample_freq = int(line[0].split(':')[1], base=10) # Hz
+        sample_dur = int(line[1].split(':')[1], base=10)  # ms
+        pass
 
     if dataIn.strip() == BEGIN_TAG:   #if input is the data we want, read it in.
         adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values
@@ -110,8 +122,16 @@ while True:
             fileName = DEFAULT_DIR + 'adcCH' + str(ch) + '_' + timeStr + '.txt'
             with open(fileName, 'w') as fd:
                 fd.write("Saved ADC Data for CH" + str(ch) + " on " + timeStr + '\n')
-                #additional meta data if need be.
+                #additional meta data if need be. Use lines as separators. 
+                fd.write("ADC Channel: " + str(ch) + "\n")
+                fd.write("Time: " + timeStr + "\n")
+                fd.write("Sample Frequency: " + str(sample_freq) + "\n")
+                fd.write("Sample Duration: " + str(sample_dur) + "\n")
+                # number of elements would help!    - if can't get right value from below, take it from ESP32 log. 
+                fd.write("Array Size: " + str(len(big_data[ch])) + '\n')
+
                 fd.write(str(big_data[chNum]))  #may or may not work
-                print("file created: ", fileName)
+                # alternatively, array can be saved to a binary file with .tofile(fd), and then read using .fromfile(fd, # to read)
+                print("PY > file created: ", fileName)
     else:
         print(dataIn)
