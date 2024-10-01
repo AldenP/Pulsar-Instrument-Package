@@ -11,7 +11,7 @@ from array import array
 
 # Configure the serial port
 serial_port = 'COM3'  # Change this to your serial port
-baud_rate = 2000000      #this can be increased by updating menuconfig UART setup for esp32 chip
+baud_rate = 921600      #this can be increased by updating menuconfig UART setup for esp32 chip
 num_samples = 8*1024      # this should match the ADC_BUFFER_LEN from ESP32 code. Currently 8KB
 
 BEGIN_TAG = b"BEGIN PY READ"    # 'b' is to interpret as binary
@@ -26,34 +26,86 @@ ser = serial.Serial(serial_port, baud_rate, timeout=5)  #5 second timeout on rea
 
 sample_freq = 0
 sample_dur = 250
+loopCompletions = 0
+total_read = 0
 
 def read_adc_data():
+    global loopCompletions
+    global total_read
     print("PY > Reading ADC Data\n")
     adc_raw = dict()    #stores channel as key, and list (or better, an array) as value (data) (or np array)
+    # printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read
     line = ser.readline()
     print("PY > " + str(line.strip(), "utf-8"))
     numBytes = line.split(b':')[1].strip()    #gets the last index (should be same as 1) and removes whitespace
-    # Read and Parse each line of data
-    # first = True
-    for i in range( int(int(numBytes,base=10) /2)):   #adjust when >1 channel of data is sent
+    # Read and Parse each line of data (2 bytes of data, so numBytes/2 gives number of elements to read)
+    for i in range( int(int(numBytes,base=10) /2) ):   #adjust when >1 channel of data is sent
         # ch: #; value: #(in hex)
         # (#),(0x#) // for speed, extra characters are eliminated
         #eventually some kind of time value will be included. Possibly the current clock cycle. 
         line = ser.readline()
+        if line.strip() == b"PY END":
+            print(f"Read end tag: {str(line, encoding='utf-8')}")
+            return adc_raw
         lineS = line.split(b',')
-        # print(str(line, "utf-8"))
+        print(str(line, "utf-8"), end="")   # has newline in it already!
         # chNum = int(lineS[0].split(b':')[1].strip()) #assumes base 10
-        chNum = int(lineS[0].strip(), base=10)
-        # val_raw = int(lineS[1].split(b':')[1].strip(), base=16)  #value is hex. 
-        val_raw = int(lineS[1].strip(), base=16)
-        if chNum not in adc_raw:   #make array for dictionary if key hasn't been entered
-            # first = False
-            adc_raw[chNum] = array('f')    #'H' is for unsigned integer, which is 2 bytes (16bit). 'f'=float
-        val_mV = val_raw * VMAX / DMAX      # Convert raw value to voltage
-        adc_raw[chNum].append(val_mV)  #append works with array. 
-    
+        try:
+            chNum = int(lineS[0].strip(), base=10)
+            # val_raw = int(lineS[1].split(b':')[1].strip(), base=16)  #value is hex. 
+            val_raw = int(lineS[1].strip(), base=16)
+            if chNum not in adc_raw:   #make array for dictionary if key hasn't been entered
+                # first = False
+                adc_raw[chNum] = array('f')    #'H' is for unsigned integer, which is 2 bytes (16bit). 'f'=float
+            val_mV = val_raw * VMAX / DMAX      # Convert raw value to voltage
+            adc_raw[chNum].append(val_mV)  #append works with array. 
+            total_read += 2
+        except ValueError:
+            print("Error reading a value from serial data in")  
+            print(f"This line of data: \"{str(line, encoding="utf-8")}\"")
+            print(f"Value of loop iterator {i=} of {numBytes=}; {loopCompletions=}; {total_read=}")
+            exit(-1)
+        except Exception as err:
+            print(f"Unexpected Error: {err}\nType: {type(err)}")
+    loopCompletions += 1
     return adc_raw
 
+def read_adc_chunk():
+    """ Reads 8192 bytes from serial 1st and processes it so internal buffer doesn't fill up, resulting in data buffer loss/corruption"""
+    global total_read
+    adc_raw = dict()
+    
+    print("PY > Reading in fixed 8192 bytes of data")
+    # ESP will first print the number of bytes it is sending ...
+    # printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read
+    line = str(ser.readline(), encoding="utf-8")
+    print("PY >", line, end='')    # line will have newline in it
+    numBytes = line.split(':')[1].strip()    #gets the last index (should be same as 1) and removes whitespace
+    print(f"PY > numBytes sent from ESP32: {numBytes}")
+
+    # use numBytes as portion to read, or 8192, whichever is less.
+    chunk = str( ser.read( min(8192, int(numBytes))) , 'utf-8')  # read returns a byte array, convert to utf-8 encoded string
+    partitioned = chunk.split("\r\n")   # don't know if serial will output \r with \n  (CRLF/Windows) or just \n (LF/Unix)
+    # read may cut a line off, and so the 1st split element might need to be removed/sacrificed. 
+    for line in partitioned:    # partitioned will have all lines of data. 
+        ls = line.split(',') # splits on separator
+        try:
+            chNum = int(ls[0].strip(), base=10)
+            raw = int(ls[1].strip(), base=16)
+            if chNum not in adc_raw:
+                adc_raw[chNum] = array('f')
+            adc_raw[chNum].append(raw * VMAX / DMAX)
+        except ValueError:
+            print("Error converting input data into integer type")
+            print(f"Data: {line=}")
+            print(f"partitioned 1st 5: {partitioned[0:5]}")
+        except Exception as err:
+            print(f"Unexpected error: {type(err)}\n{err}")
+            return
+        # finally:
+        #     pass
+        total_read += 2
+    return adc_raw
 # def calculate_pulse_timing(adc_data, sampling_rate):
 #     # Smooth the ADC data using Savitzky-Golay filter
 #     smoothed_data = savgol_filter(adc_data, window_length=51, polyorder=3)
@@ -76,18 +128,22 @@ while True:
     #Reads data as bytes. Will need to convert to char/string then.
     dataIn = ser.readline()    #timeout set by serial object
     if dataIn == b'':
-        print('Py > Timed Out with no new data (%d)\n', timeoutCount)  #print to console if timed out
+        print('Py > Timed Out with no new data (%d)', timeoutCount)  #print to console if timed out
         timeoutCount +=1
 
     if dataIn.strip() == META_TAG:
-        # get metadata from serial/ESP32: printf("%s | freq: %"PRIu32"; duration: %"PRIu32"", PY_DATA, sample_frequency, sample_duration);   //in Hz and ms
-        line = dataIn.split("|")[1].split(";")
-        sample_freq = int(line[0].split(':')[1], base=10) # Hz
-        sample_dur = int(line[1].split(':')[1], base=10)  # ms
-        pass
+        # get metadata from serial/ESP32: printf("%s\nfreq: %"PRIu32"; duration: %"PRIu32"\n", PY_DATA, sample_frequency, sample_duration);   //in Hz and ms
+        # line = dataIn.split("|")[1].split(";")
+        dataIn = ser.readline()
+        line = dataIn.strip().split(b';')
+        sample_freq = int(line[0].split(b':')[1], base=10) # Hz
+        sample_dur = int(line[1].split(b':')[1], base=10)  # ms
+        print(f'Py > {sample_freq=}; {sample_dur=}')
 
     if dataIn.strip() == BEGIN_TAG:   #if input is the data we want, read it in.
-        adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values
+        # adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values
+        adc_data_partial = read_adc_chunk()
+        loopCompletions += 1
         adc_data.append(adc_data_partial)
         # esp32 may need >1 loop to send data over. adc_data must be stored on the side until sample is done (wait for tag)
         # Process the ADC data here - process data later, after the full sample has been sent.
@@ -133,5 +189,8 @@ while True:
                 fd.write(str(big_data[chNum]))  #may or may not work
                 # alternatively, array can be saved to a binary file with .tofile(fd), and then read using .fromfile(fd, # to read)
                 print("PY > file created: ", fileName)
+        
+        loopCompletions = 0 # reset loop counter
+        total_read = 0
     else:
-        print(dataIn)
+        print(str(dataIn, encoding='utf-8'), end='')    # using UTF-8 encoding shows the colors of the output. newline in dataIn
