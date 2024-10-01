@@ -56,5 +56,13 @@ void rotator_uart_init();
  */
 int send_rotator_cmd(char address, char cmd[2], char data[], char* out);
 
+/**
+ * Function that decodes the response from the rotation mount. 
+ * @param response: recieved data over uart from mount
+ * @param length: length of the response, in bytes (characters)
+ * @param out: pointer to output buffer to hold 
+ */
+int decode_rotator_response(char *response, size_t length, char *out);
+
 
 #endif
