@@ -55,7 +55,7 @@
 #define SD_DAT2         GPIO_NUM_12     // yellow wire
 #define SD_DAT3         GPIO_NUM_13     // orange wire
 // - SD Params -
-#define SD_LINE_WIDTH   1               // want 4-line/bit width, but doesn't work, so 1-line it is (for now)
+#define SD_LINE_WIDTH   4               // want 4-line/bit width, but doesn't work, so 1-line it is (for now)
 #define SD_FREQUENCY    SDMMC_FREQ_HIGHSPEED    // 40MHz fastest, default is 20MHz, and probing (slowest) is 400kHz
 // --- LEDs ---
 #define GREEN_LED       GPIO_NUM_0      // General debug LED (button presses)
@@ -115,7 +115,7 @@ static size_t num_adc_channels = sizeof(channel) / sizeof(adc_channel_t);
 
 // ----- TASKS -----
 // make this large enough to avoid task stack overflows. if too large, scale back, or set it per task 
-#define TASK_STACK_SIZE                 KB_TO_BYTES(4)    //4kB
+#define TASK_STACK_SIZE                 KB_TO_BYTES(8)    //8kB
 static TaskHandle_t main_task_handle = NULL;
 static const char *MAIN_TAG = "MAIN-TASK";
 
@@ -150,11 +150,11 @@ static const char * PY_DATA = "PY METADATA";        // tag to tell python here i
 // ----- STATE VARIABLES -----
 // volatile if value can change within an ISR context
 volatile bool adc_state = false; 
-volatile bool led_state = false;        //green (debug) LED state 
-volatile bool red_led_state = false;    // the status LED
-volatile bool blue_led_state = false;   // the overflow LED
+volatile bool led_state = false;            //green (debug) LED state 
+volatile bool red_led_state = false;        // the status LED
+volatile bool blue_led_state = false;       // the overflow LED
 volatile bool pupil_path_state = false;     // essentially the state of the servos
-static int servo_angle = 0;               // angle of servos 
+static int servo_angle = 0;                 // angle of servos 
 // --- menu variables ---
 volatile uint16_t base_pos = 0;     // index of base array. shared between duration and frequency. reset to zero as needed.
 // volatile uint16_t lcd_curPos = 0;   // column position, based on base pos, dependent on menu index. 
@@ -343,12 +343,15 @@ static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc
 // ----- ISRs -----
 static void IRAM_ATTR start_isr_handler(void* arg) {
     // give notice to adc task, which initializes the adc module with sample frequency, and runs until all data read.
-        // get ADC handler from arg
+    if (gpio_get_level(START_BUT) == 1) {
+        return; // not the proper time to take interrupt
+    }   // else continue with debounce scheme
+    // get ADC handler from arg
     my_handlers_t *handles = (my_handlers_t*) arg;
     adc_continuous_handle_t *adc_handle = handles->adc_handle;
     // debounce scheme first.
     gptimer_handle_t *t_handle = handles->gptimer;
-    gpio_intr_disable(ROTARY_SWITCH);
+    gpio_intr_disable(START_BUT);   // logical error: had wrong GPIO tag
     // gptimer_set_raw_count(*t_handle, 0);
     gptimer_start(*t_handle);
 
@@ -367,8 +370,11 @@ static void IRAM_ATTR start_isr_handler(void* arg) {
 }
 static void IRAM_ATTR aux_isr_handler(void* arg) {
     // debounce scheme first.
+    if (gpio_get_level(AUX_BUT) == 1) {
+        return;
+    }   // else continue to debounce
     gptimer_handle_t *t_handle = ((my_handlers_t*)arg)->gptimer;
-    gpio_intr_disable(ROTARY_SWITCH);
+    gpio_intr_disable(AUX_BUT); // also had logical error (had ROTARY_SWITCH instead)
     // gptimer_set_raw_count(*t_handle, 0);
     gptimer_start(*t_handle);
     // provide visual output of button press
@@ -387,13 +393,17 @@ static void IRAM_ATTR aux_isr_handler(void* arg) {
 // Handler for the rotary switch interrupt
 static void IRAM_ATTR rot_switch_isr_handler(void* args) {
     // Changes position/digit of sample duration/frequency
-    led_state = !led_state;
-    gpio_set_level(GREEN_LED, led_state);
+    if (gpio_get_level(ROTARY_SWITCH) == 1) {
+        return; //        
+    }   // (else) when the level is low, then debounce
+    led_state = !led_state; 
+    gpio_set_level(GREEN_LED, led_state);   // visually indicated button push registered
     // debounce scheme first. (seems to need a long timer. )
-    gptimer_handle_t *t_handle = (gptimer_handle_t*) args;
-    gpio_intr_disable(ROTARY_SWITCH);
+    gptimer_handle_t *t_handle = (gptimer_handle_t*) args;  //get timer handle from args
+    gpio_intr_disable(ROTARY_SWITCH);   // prevent other interrupts
     // gptimer_set_raw_count(*t_handle, 0);
     gptimer_start(*t_handle);
+    
     // now update position
     // if on pupil imaging menu, pressing dial will change it's state
     BaseType_t mustYield = pdFALSE;
@@ -474,7 +484,7 @@ static void adc_task(void* args) {
         blue_led_state = 0;
 
         // FUTURE: start waveplate. Abort if status not OKAY
-        // assume that the waveplate has been pre-configured
+        // assume that the waveplate has been pre-configured (TX 0sv32, TX 0sj00000000, TX 0ho1 [home])
         // send "fw" to run waveplate continuously
 
         // give a 3 second countdown. (perhaps before the waveplate, when that gets implemented) 
@@ -807,7 +817,7 @@ void app_main(void) {
     // Set log level to allow display of debug-level logging
     esp_log_level_set(MAIN_TAG, ESP_LOG_DEBUG);
     esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);
-    esp_log_level_set("*", ESP_LOG_DEBUG);  // enables debug logs globally (for debugging SD card)
+    esp_log_level_set("*", ESP_LOG_VERBOSE);  // enables debug logs globally (for debugging SD card)
     // ---- gpio setup ----
     // -- gpio inputs
     gpio_config_t io_conf = {};
@@ -1027,6 +1037,9 @@ void app_main(void) {
     #pragma endregion
     // --- SD Card / SDMMC ---
     #pragma region
+    ESP_LOGI(MAIN_TAG, "Waiting to initialize SD card (2s). Ensure clock wire is secured.");
+    vTaskDelay(2000/portTICK_PERIOD_MS);
+
     esp_vfs_fat_sdmmc_mount_config_t mount_conf = {
         .format_if_mount_failed = FORMAT_IF_MOUNT_FAILS,
         .max_files = 8,    // max # of open files
@@ -1115,15 +1128,15 @@ void app_main(void) {
             lcd1602_string(lcd_ctx, strBuf);
         }
         // check if SD card is inserted or not, if not, display a message, else ... temporarily display one? 
-        if (gpio_get_level(SD_DETECT) == 0) {
-            snprintf(strBuf, 22, " %-20s", "No SD Card Inserted!");
-            lcd1602_set_cursor(lcd_ctx, 0, 19);
-            lcd1602_string(lcd_ctx, strBuf);
-        }  else {   //else clear that line!
-            snprintf(strBuf, 22, " %s", BLANK_LINE);
-            lcd1602_set_cursor(lcd_ctx, 0, 19);
-            lcd1602_string(lcd_ctx, strBuf);
-        } 
+        // if (gpio_get_level(SD_DETECT) == 0) {
+        //     snprintf(strBuf, 22, " %-20s", "No SD Card Inserted!");
+        //     lcd1602_set_cursor(lcd_ctx, 0, 19);
+        //     lcd1602_string(lcd_ctx, strBuf);
+        // }  else {   //else clear that line!
+        //     snprintf(strBuf, 22, " %s", BLANK_LINE);
+        //     lcd1602_set_cursor(lcd_ctx, 0, 19);
+        //     lcd1602_string(lcd_ctx, strBuf);
+        // } 
         // change menu based on menu index, and display the appropriate value
         if (menuIndex == 0) {           //frequency
             lcd1602_set_cursor(lcd_ctx, 0, 1);
