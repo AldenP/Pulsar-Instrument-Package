@@ -88,7 +88,7 @@
 // --- ---
 #define ROTARY_HIGH         4
 #define ROTARY_LOW          -4
-#define DEBOUNCE_TIME_MS    150     // time to wait, in milliseconds, before re-enabling button interrupts
+#define DEBOUNCE_TIME_MS    300     // time to wait, in milliseconds, before re-enabling button interrupts
 // naively increase buffer size to permit longer sample duration.
 #define ADC_BUFFER_LEN                  KB_TO_BYTES(16)
 #define DEFAULT_ADC_FREQ                20000 // true default of 1,000,000 Hz
@@ -174,7 +174,7 @@ static const char *servoStatus[] = {"OFF", " ON"};  //default is off, turn on wi
 uint8_t adc_conv_buffer[ADC_BUFFER_LEN] = {0};   // result buffer for adc_copy_task; should it be static?
 
 static uint16_t sample_num = 0; // number to set directory name for samples
-#define SAMPLE_LOG_DIR      "SAMP_LOG"     // folder to hold logs for each sample
+#define SAMPLE_LOG_DIR      "/SAMP_LOG"     // folder to hold logs for each sample
 // FILE * sample_files[10];    // arary of FILE pointers (*) used to store list of files from a sample session.
 // ----- -----
 // --- Parameters ---
@@ -230,8 +230,9 @@ static esp_err_t get_file_path(char * out, /*uint16_t ch_num,*/ uint16_t fileNum
     struct stat st;
     if (stat(out, &st) == 0) {
         // file already exists! return error, as we do not want to overwrite data.
-        // this shouldn't happen unless the cycles count somehow overlaps between runs
-        return ESP_FAIL;
+        // this shouldn't happen unless MCU is reset and so sample_num resets to zero. Could increment sample_num until it works?
+        // increment sample_num here, or where function is called? New problem would be ensuring that the folder exists.
+        return ESP_OK;  // QoL FIX: prevent data from being overwritten? 
     }
     return ESP_OK;
 }
@@ -242,7 +243,6 @@ static esp_err_t get_file_path(char * out, /*uint16_t ch_num,*/ uint16_t fileNum
  * @returns Returns either ESP_OK or ESP_FAILS if file fails to open
  */
 static esp_err_t append_log_file(char *file_path, char* data) {
-
     FILE *f = fopen(file_path, "a");  // append mode (to end of file). Will create a file if needed
     if (f == NULL) {
         return ESP_FAIL;
@@ -263,10 +263,25 @@ static esp_err_t append_log_file(char *file_path, char* data) {
  *  ESP_ERR_INVALID_STATE if end-of-file (EOF) is reached.
  */
 static esp_err_t read_line_file(FILE* fp, char* out, size_t max_length) {
-    size_t num_read = 0;
-    while( (*(out+1) = fgetc(fp)) != '\n' && num_read++ < max_length -1);    // one liner!
-    *(out+1) = 0;   // null-termination
-    if (num_read >= max_length)
+    //size_t num_read = 0;
+    size_t i = 0;
+    // while( (*(out+i) = fgetc(fp)) != '\n' && i++ < max_length -1) i++;    // one liner!
+    for (i = 0; i < max_length -1; i++) {
+        int ch = fgetc(fp);
+        if (ch == '\n') {
+            // stop b/c of newline. b/c using a file, file cursor keeps position.
+            break;
+        }   // could combine into one if statement, but if need to distinguish for debug...
+        if (ch == 0)    // null char
+            break;
+        if (ch == EOF)  //EOF is -1
+            break;
+        // if current character is none of these, assign it to our string
+        *(out+i) = ch;
+    }
+    *(out+i) = 0;   // null-termination. overwrites the newline.
+
+    if (i >= max_length)
         return ESP_ERR_TIMEOUT;
     if (feof(fp)) 
         return ESP_ERR_INVALID_STATE;
@@ -286,6 +301,24 @@ static esp_err_t read_line_file(FILE* fp, char* out, size_t max_length) {
 //     return ESP_OK;
 // }
 
+/**
+ * Sees if a folder/directory exists at the given path. If not, creates a new directory (mkdir)
+ * @param dir_path: Path to the directory for an existence check
+ * @param make_dir: Boolean to create directory if it doesn't already exist
+ * @returns Returns ESP_OK if directory (or file) exists. ESP_ERR_NOT_FOUND if path doesn't exist
+ */
+static esp_err_t check_dir(char *dir_path, bool make_dir) {
+    struct stat st;
+    if (stat(dir_path, &st) != 0) {
+        // the path doesn't exist
+        if (make_dir) {
+            mkdir(dir_path, ACCESSPERMS);   // make directory, if desired
+            return ESP_OK;
+        }   // else return not found error
+        return ESP_ERR_NOT_FOUND;
+    }
+    return ESP_OK;  // path exists
+}
 // ----- ADC ISRs -----
 static bool IRAM_ATTR adc_conv_ready_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data) {
     // 1st, update number of bytes read from event data.
@@ -309,10 +342,19 @@ static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc
     adc_continuous_handle_t handle = NULL;  // ? shouldn't this be malloc if we're outputting it to `out_handle`
 
     adc_continuous_handle_cfg_t adc_config = {
-        .max_store_buf_size = 16 * ADC_BUFFER_LEN,
+        .max_store_buf_size = 2 * ADC_BUFFER_LEN,   // be careful: can run out of mem if not careful. 
         .conv_frame_size = ADC_BUFFER_LEN,
     };
+    // For debugging no_mem errors, print out how much heap memory is available
+    ESP_LOGI(MAIN_TAG, "(Before) Free heap: %"PRIu32" B; Free internal heap: %"PRIu32" B", esp_get_free_heap_size(), esp_get_free_internal_heap_size());
+    if (esp_log_level_get(MAIN_TAG) == ESP_LOG_VERBOSE)
+        heap_caps_dump_all();   // prints all info on allocated heaps!
+    
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &handle));
+    
+    ESP_LOGI(MAIN_TAG, "(After) Free heap: %"PRIu32" B; Free internal heap: %"PRIu32" B", esp_get_free_heap_size(), esp_get_free_internal_heap_size());
+    if (esp_log_level_get(MAIN_TAG) == ESP_LOG_VERBOSE)
+        heap_caps_dump_all();   // prints all info on allocated heaps!
 
     taskENTER_CRITICAL(&param_lock);    // protect access to sample frequency
     adc_continuous_config_t dig_cfg = {
@@ -457,7 +499,24 @@ static void adc_task(void* args) {
             ESP_LOGW(ADC_TASK_TAG, "Pupil imaging path on, cannot start ADC");
             continue;   // will go wait again
         }
-        // also check SD card
+        // also check SD card detect pin
+        // check if sample folder exists, if not, create it
+        char tmpBuf[64] = {0};
+        snprintf(tmpBuf, 64, "%s/SAMPLE%02u/", SD_MOUNT, sample_num);
+        // created function to check existence of folder, and create it, if desired.
+        if (check_dir(tmpBuf, true) != ESP_OK) {
+            // only occurs if 'make_dir' is false.  
+            ESP_LOGW(ADC_TASK_TAG, "Could not create folder (%s) for samples (does not exist).", tmpBuf);
+            continue;
+        }
+        // overwrite/clear past log files
+        snprintf(tmpBuf, 64, "%s%s/samp%03u.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
+        if (check_dir(tmpBuf, false) == ESP_OK) {
+            // file exists, remove it (FUTURE: rename it? ie, append '.old' to file?)
+            unlink(tmpBuf); // unlink == remove
+            ESP_LOGW(ADC_TASK_TAG, "Removed previous log file (%s)", tmpBuf);
+        }
+
         ESP_LOGI(ADC_TASK_TAG, "Beginning ADC setup...");
         ESP_LOGI(ADC_TASK_TAG, "Suspending monitor task (logging)");
         vTaskSuspend(monitor_handle);
@@ -555,32 +614,37 @@ static void adc_copy_task(void* args) {
 
         // char unit[] = EXAMPLE_ADC_UNIT_STR(EXAMPLE_ADC_UNIT);   //not used (except in an else)
         while (1) {
-            ret = adc_continuous_read(*adc_handle, adc_conv_buffer, ADC_BUFFER_LEN, &ret_num, 0);
+            ret = adc_continuous_read(*adc_handle, adc_conv_buffer, ADC_BUFFER_LEN, &ret_num, 1);
             if (ret == ESP_OK) {
                 ESP_LOGI(ADC_COPY_TAG, "return val is %x, ret_num is %"PRIu32" bytes", ret, ret_num);
                 #if USE_SD_CARD
                 // Get a file path to write results to, write to it, then close file.
-                if (get_file_path(file_path, file_num) != ESP_OK) {
-                    ESP_LOGE(ADC_COPY_TAG, "Error getting file path (%s)", file_path);
+                while (get_file_path(file_path, file_num) != ESP_OK) {
+                    ESP_LOGE(ADC_COPY_TAG, "Error getting file path (%s). File Exists!", file_path);
+                    // sample_num++;   // update sample number
+                    // before breaking, must resume adc_task, otherwise infinite loop (will perpetually read data)
+                    vTaskResume(adc_task_handle);   
+                    vTaskDelay(1000/portTICK_PERIOD_MS);
                     break;  // breaks this loop, data will not be saved to a file!
                 }
-                file_num++; // increment the file num for next time
+                file_num += 1; // increment the file num for next time
                 FILE * f = fopen(file_path, "wb");  // open for binary writing
                 if (f == NULL) {
                     ESP_LOGE(ADC_COPY_TAG, "Error openning file (%s)", file_path);
+                    perror("Error Description");   // prints error message after failed FILE operation
                     break;
                 }
                 // // fwrite or fprintf the number of bytes to read then newline. alternatively, make a metadata file that presides over multiple files
                 // // fwrite result buffer to a file (will write data as binary, therefore is most optimal!)
-                fprintf(f, "size:%0lu\n", ret_num);  // number of bytes of data in file (total size: 5+10+1 = 16 bytes total)
+                fprintf(f, "size:%010lu\n", ret_num);  // number of bytes of data in file (total size: 5+10+1 = 16 bytes total)
                 fwrite(adc_conv_buffer, ret_num, sizeof(adc_conv_buffer[0]), f);    // write the result buffer to the file!
                 fclose(f);  // close file to flush changes to it. 
                 // Add file_path and bytes written to a data file.
-                // // I wrote a function that does this...
-                snprintf(data_file, 64, "%s/%s/samp%03u.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
+                snprintf(data_file, 64, "%s%s/samp%03u.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
                 snprintf(temp_data, 128, "File: %s\nBytes Written: %0lu", file_path, ret_num);
                 if (append_log_file(data_file, temp_data) == ESP_FAIL) {
                     ESP_LOGE(ADC_COPY_TAG, "Error writing to log_file (%s)", data_file);
+                    perror("Error Description");   // prints error message after failed FILE operation
                     break;
                 };
                 // log file updated
@@ -614,7 +678,7 @@ static void adc_copy_task(void* args) {
                     // printf("PY STOP");   // python error was from an internal buffer filling up, not requiring a termination key word
                     // resume ADC task to stop ADC and clean up
                     ESP_LOGI(ADC_COPY_TAG, "total bytes read: %"PRIu32"", bytes_read);
-                    ESP_LOGI(ADC_COPY_TAG, "sample bytes to read: %"PRIu32"", bytes_to_read);
+                    ESP_LOGI(ADC_COPY_TAG, "minimum sample bytes to read: %"PRIu32"", bytes_to_read);
                     vTaskResume(adc_task_handle);
                     vTaskDelay(1500/portTICK_PERIOD_MS); //give adc_task some time before breaking and waiting above
                     break;  // exit the inner while loop to wait for notify by adc_conv_done_cb
@@ -623,7 +687,8 @@ static void adc_copy_task(void* args) {
                 // vTaskResume(main_task_handle);
                 vTaskDelay(1);  // 1tick block to avoid watchdog timer.
             } else if (ret == ESP_ERR_TIMEOUT) {
-                //We try to read `EXAMPLE_READ_LEN` until API returns timeout, which means there's no available data
+                // timeout occured
+                ESP_LOGW(ADC_COPY_TAG, "Timeout error from adc_read_continuous: %s", esp_err_to_name(ret));
                 break;
             }
             else {  //catch other return values and print it
@@ -638,7 +703,7 @@ static void adc_copy_task(void* args) {
 // Task to transfer adc data from file to PC
 static void adc_transfer_task(void* args) {
     esp_err_t ret;
-    uint8_t result[ADC_BUFFER_LEN]; // holder for results array read from file.
+    uint8_t result[ADC_BUFFER_LEN]; // holder for results array read from file. -- may be able to reuse adc_conv_buffer to save on heap memory!
     char strBuf[128] = { 0 };   // buffer to hold data that is read in from the data file
     char data_file[64] = { 0 }; // buffer to hold the data file to be openned.
     uint32_t ret_num = 0;   // number bytes from file
@@ -651,10 +716,12 @@ static void adc_transfer_task(void* args) {
         // snprintf(data_file, 64, "%s/%s/samp%03u.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
         // snprintf(temp_data, 64, "File: %s\nBytes Written: %"PRIu32"\n", file_path, ret_num);
         // Read in the files that we need to transfer to PC from the sample log file
-        snprintf(data_file, 64, "%s/%s/samp%03u.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
+        snprintf(data_file, 64, "%s%s/samp%03u.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
         FILE * f = fopen(data_file, "r");
         if (f == NULL) {
             ESP_LOGE(ADC_TRANS_TAG, "Error openning log file: %s", data_file);
+            perror(NULL);   // prints error message after failed FILE operation
+            clearerr(f);
             // before waiting in notify, resume adc_task to avoid requiring a hard reset
             vTaskResume(adc_task_handle);
             continue;   // loops to wait for notify
@@ -663,7 +730,9 @@ static void adc_transfer_task(void* args) {
             // contains records of 2 lines: 1st line gives "File: <file_name>", 2nd gives "Bytes Written: <bytes wrote>" for each file!
             ret = read_line_file(f, strBuf, 128);   // 1st line from data_file
             if (ret != ESP_OK) {
-                ESP_LOGW(ADC_TRANS_TAG, "Problem reading 1st line (could be EOF). strBuf: %s", strBuf);
+                ESP_LOGW(ADC_TRANS_TAG, "Problem reading 1st line (could be EOF). strBuf: %s", strBuf); // can check EOF with feof(FILE*)
+                perror("Error Description");   // prints error message after failed FILE operation
+                clearerr(f);
                 break;
             }
             // now split the line based on ':' delimiter, using strtok function (in string.h)
@@ -678,6 +747,8 @@ static void adc_transfer_task(void* args) {
             FILE *sample_file = fopen(token, "rb");
             if (sample_file == NULL) {
                 ESP_LOGE(ADC_TRANS_TAG, "Error openning sample file (%s)", token);
+                perror("Error Description");   // prints error message after failed FILE operation
+                clearerr(sample_file);
                 // vTaskResume(adc_task_handle);   // resume the adc_task since error occured. 
                 break;   // goes and waits at notify statement.
             }   //else continue on
@@ -687,8 +758,9 @@ static void adc_transfer_task(void* args) {
                 ESP_LOGW(ADC_TRANS_TAG, "Problem reading 2nd line. strBuf: %s", strBuf);
                 break;
             }
-            token = strtok(strBuf, " :");   // split string on spaces and colons.
-            token = strtok(NULL, " :");     // second string after split
+            token = strtok(strBuf, " :");   // split string on spaces and colons.   (Bytes)
+            token = strtok(NULL, " :");     // second string after split (Written:)
+            token = strtok(NULL, " :");     // 3rd string   (<number>)
             sscanf(token, "%lu", &ret_num); // convert string into a 32-bit unsigned int.
             if (ret_num == 0)   {
                 ESP_LOGE(ADC_TRANS_TAG, "Error parsing number of bytes. token string: %s; integer: %lu", token, ret_num);
@@ -815,9 +887,11 @@ void app_main(void) {
 
     main_task_handle = xTaskGetCurrentTaskHandle();     // get task handle for main
     // Set log level to allow display of debug-level logging
+    esp_log_level_set("*", ESP_LOG_VERBOSE);  // enables debug logs globally (for debugging SD card)
     esp_log_level_set(MAIN_TAG, ESP_LOG_DEBUG);
     esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);
-    esp_log_level_set("*", ESP_LOG_VERBOSE);  // enables debug logs globally (for debugging SD card)
+    esp_log_level_set("sdmmc_req", ESP_LOG_DEBUG);
+    esp_log_level_set("sdmmc_cmd", ESP_LOG_DEBUG);
     // ---- gpio setup ----
     // -- gpio inputs
     gpio_config_t io_conf = {};
@@ -1060,6 +1134,7 @@ void app_main(void) {
     // slot_conf.gpio_cd = SD_DETECT;  // we will use the SD detect to prevent ADC from running if no place to put data!
     slot_conf.width = SD_LINE_WIDTH;    // configurable line width
     // External pullups are used, so internal pullups unnecessary.
+    slot_conf.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
     ESP_LOGI(MAIN_TAG, "Mounting filesystem");
     ret = esp_vfs_fat_sdmmc_mount(mount_point, &host_handle, &slot_conf, &mount_conf, &card_handle);
 
@@ -1076,6 +1151,16 @@ void app_main(void) {
     sdmmc_card_print_info(stdout, card_handle); // prints info on the SD card connected
     // ESP_LOGW(MAIN_TAG, "SD card not yet implemented, filesystem NOT mounted!");
     #pragma endregion
+
+    // create log file folder, if it doesn't already exist
+    char tmpBuf[64] = {0};
+    sprintf(tmpBuf, "%s%s/", SD_MOUNT, SAMPLE_LOG_DIR);
+    struct stat st;
+    if (stat(tmpBuf, &st) != 0) {
+        // then an error occured, likely a dir not found
+        mkdir(tmpBuf, ACCESSPERMS);
+        ESP_LOGI(ADC_TASK_TAG, "Directory created for sample logs: %s", tmpBuf);
+    } // else stat will have info on the folder.
 
     adc_continuous_handle_t handle = NULL;  //needed in many places, hold it here for distribution.
 
