@@ -506,7 +506,7 @@ static void adc_task(void* args) {
         // created function to check existence of folder, and create it, if desired.
         if (check_dir(tmpBuf, true) != ESP_OK) {
             // only occurs if 'make_dir' is false.  
-            ESP_LOGW(ADC_TASK_TAG, "Could not create folder (%s) for samples (does not exist).", tmpBuf);
+            ESP_LOGE(ADC_TASK_TAG, "Could not create folder (%s) for samples (does not exist).", tmpBuf);
             continue;
         }
         // overwrite/clear past log files
@@ -520,7 +520,7 @@ static void adc_task(void* args) {
         ESP_LOGI(ADC_TASK_TAG, "Beginning ADC setup...");
         ESP_LOGI(ADC_TASK_TAG, "Suspending monitor task (logging)");
         vTaskSuspend(monitor_handle);
-        // suspend other tasks as necessary
+        // suspend other tasks as necessary, or suppress logging somehow
 
         // start by getting some variables designed.
         *adc_handle = NULL; // set handle to NULL. 
@@ -952,6 +952,22 @@ void app_main(void) {
     // use functions defined in rotator_driver.h
     // set velocity ("sv") to 50-70% of max. so 0x32 to 0x48 would be sent as ASCII ('3' + '2', etc. )
     // set jog step size to 0 for continuous ("sj")
+    init_waveplate_uart();  // initialize the UART for the waveplate
+    send_waveplate_command("ho", 1, 1);
+    if (!read_waveplate_response()) {
+        ESP_LOGE(MAIN_TAG, "Error returning waveplate to home position");
+        // return?
+    }
+    send_waveplate_command("sv", 50, 2);    // set speed to 50%
+    // read response, continue if OK
+    if (!read_waveplate_response()) {
+        ESP_LOGE(MAIN_TAG, "Error setting velocity for waveplate");
+    }
+    send_waveplate_command("sj", 0, 8);     // set jog size to 0 for continuous motion
+    if (!read_waveplate_response()) {
+        ESP_LOGE(MAIN_TAG, "Error setting jog step");
+    }
+
     #pragma endregion
     // // --- I2C LCD ---
     #pragma region 
