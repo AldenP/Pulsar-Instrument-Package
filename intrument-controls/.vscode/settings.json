@@ -18,6 +18,12 @@
     "files.associations": {
         "gpio.h": "c",
         "mcpwm.h": "c",
-        "pcnt.h": "c"
+        "pcnt.h": "c",
+        "freertos.h": "c",
+        "task.h": "c",
+        "unistd.h": "c",
+        "stat.h": "c",
+        "sdkconfig.h": "c",
+        "freertosconfig.h": "c"
     }
 }
