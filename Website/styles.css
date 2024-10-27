@@ -18,7 +18,6 @@ p {
 .list {
     font-family :'Trebuchet MS';
     /* padding: left 10px; */
-
 }
 #grpMem {
     margin: 10px 10px 10px 10px;
@@ -32,25 +31,17 @@ p {
 #reviewers {
     margin: 5px 10px 10px 10px;
     text-align: center;
-
 }
 #nameDiv {
     border: solid;
     border-width: 0px 0px 3px;
-
 }
-.navBar {
-    margin: 5px;
-    padding: 5px;
-    border-style: groove; 
-    border-width: 3px;
-}
-#teamPage {
+/* #teamPage {
     padding: 1px;
     border-style: inset;
     border-width: 3px;
     border-color: silver;
-}
+} */
 .aboutList {
     padding: 3px 0px;
 }
@@ -72,13 +63,70 @@ p {
     border-top-style: double;
 
 }
-#demoVideo {
+#demoVideo1 {
     /* margin: auto; */
     margin-left: 10%;
     margin-right: 20%;
     padding: 3px;
-    
+
     text-align: center;
     border-style: groove;
     border-color: black; 
+}
+#sd2_CDR {
+    margin-left: 15%;
+    margin-right: 10%;
+}
+#sd2_MT_Demo {
+    margin-left: 25%;
+    margin-right: 15%;
+    padding: 3px;
+
+    text-align: center;
+    border-style: double;
+    border-color: black; 
+}
+/* Horizontal Navigation Bar Classes and Styles */
+.navBar {
+    margin: 5px;
+    padding: 5px;
+    /* border-radius: 10px; */
+    border-style: groove; 
+    border-width: 3px;
+}
+.navBarList {   /* an instance of <ul>*/
+    list-style-type: none;
+    margin: 0;
+    padding: 0;
+    background-color:blue;
+}
+.navLI {        /*an instance of <li>*/
+    float: left;
+}
+.navLink {      /* an instance of <a>*/
+    display: block;
+    float: left;
+    padding: 3px 8px;
+    background-color:lightgray;
+    /* background-image: linear-gradient(to top-right, ivory, darkgray, slategray, darkgray, ivory); */
+    background-size: auto;
+    background-repeat: none;
+    text-decoration: none;
+    color: #303030;
+    border-style: ridge;
+    border-color:lightblue;
+    border-width: 3px;
+}
+.navLink:hover:not(.active) {
+    background-color: slategray;
+    border-color: black;
+    border-style: solid;
+    border-width: 3px;
+    color: aliceblue;
+}
+.active {       /* instance of <a>*/
+    background-color: turquoise;
+    border-style: double;
+    border-width: 3px;
+    border-color: black;
 }
