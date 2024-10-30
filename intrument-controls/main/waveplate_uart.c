@@ -53,7 +53,7 @@ void send_waveplate_command(const char* command, uint8_t data, size_t data_len) 
         sprintf(cmd_buf, "%c%2s", WAVEPLATE_ADDR, command);
     }
     // Write the command to the UART bus
-    int ret = uart_write_bytes(WAVE_UART_NUM, command, strlen(cmd_buf));
+    int ret = uart_write_bytes(WAVE_UART_NUM, cmd_buf, strlen(cmd_buf));
     if (ret == -1) {
         ESP_LOGE(WAVE_TAG, "UART parameter error when sending waveplate command");
         return;
@@ -73,7 +73,7 @@ int read_waveplate_response() {
     if (length > 0) {
         data[length] = '\0';  // Null-terminate the received data to treat it as a string
         // printf("Waveplate response: %s\n", data);  // Print the response for debugging purposes
-        ESP_LOGI(WAVE_TAG, "Response from Waveplate: %s", data);
+        ESP_LOGI(WAVE_TAG, "Response from Waveplate: \"%s\"", data);
         // extract the status message/integer if the command is GS (get status)
 
         return 1;   // return true value
