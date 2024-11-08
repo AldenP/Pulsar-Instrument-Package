@@ -74,7 +74,7 @@
 #define _EXAMPLE_ADC_UNIT_STR(unit)         #unit
 #define EXAMPLE_ADC_UNIT_STR(unit)          _EXAMPLE_ADC_UNIT_STR(unit)
 #define EXAMPLE_ADC_CONV_MODE               ADC_CONV_SINGLE_UNIT_1
-#define EXAMPLE_ADC_ATTEN                   ADC_ATTEN_DB_2_5        //FIX: set to 0dB on final implementation
+#define EXAMPLE_ADC_ATTEN                   ADC_ATTEN_DB_0        //FIX: set to 0dB on final implementation
 #define EXAMPLE_ADC_BIT_WIDTH               SOC_ADC_DIGI_MAX_BITWIDTH
 
 #define EXAMPLE_ADC_OUTPUT_TYPE             ADC_DIGI_OUTPUT_FORMAT_TYPE1
@@ -110,7 +110,7 @@
 // ----- -----
 
 // use channels 0-3 of ADC1 for the ESP32
-static adc_channel_t channel[1] = {ADC_CHANNEL_0};//{ADC_CHANNEL_0, ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_3}; //don't forget size
+static adc_channel_t channel[2] = {ADC_CHANNEL_0, ADC_CHANNEL_1};//{ADC_CHANNEL_0, ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_3}; //don't forget size
 static size_t num_adc_channels = sizeof(channel) / sizeof(adc_channel_t);
 
 // ----- TASKS -----
@@ -506,7 +506,7 @@ static void adc_task(void* args) {
         // created function to check existence of folder, and create it, if desired.
         if (check_dir(tmpBuf, true) != ESP_OK) {
             // only occurs if 'make_dir' is false.  
-            ESP_LOGW(ADC_TASK_TAG, "Could not create folder (%s) for samples (does not exist).", tmpBuf);
+            ESP_LOGE(ADC_TASK_TAG, "Could not create folder (%s) for samples (does not exist).", tmpBuf);
             continue;
         }
         // overwrite/clear past log files
@@ -520,7 +520,7 @@ static void adc_task(void* args) {
         ESP_LOGI(ADC_TASK_TAG, "Beginning ADC setup...");
         ESP_LOGI(ADC_TASK_TAG, "Suspending monitor task (logging)");
         vTaskSuspend(monitor_handle);
-        // suspend other tasks as necessary
+        // suspend other tasks as necessary, or suppress logging somehow
 
         // start by getting some variables designed.
         *adc_handle = NULL; // set handle to NULL. 
@@ -576,9 +576,11 @@ static void adc_task(void* args) {
 
     #if USE_SD_CARD
         // notify ADC transfer task
-        xTaskNotifyGive(adc_transfer_handle);
+        // FIX ME: When python serial monitor is ready, uncomment this.
+        // xTaskNotifyGive(adc_transfer_handle);
         // wait for transfer to complete!   (2 options: use notification, or suspend this task [riskier?])
-        vTaskSuspend(NULL);
+        // vTaskSuspend(NULL);
+        ESP_LOGW(ADC_TASK_TAG, "Skipping file output to console. Get data off of SD card instead.");
         // Update sample_num after data has been transfered to PC
         sample_num++; 
     #endif
@@ -641,7 +643,8 @@ static void adc_copy_task(void* args) {
                 fclose(f);  // close file to flush changes to it. 
                 // Add file_path and bytes written to a data file.
                 snprintf(data_file, 64, "%s%s/samp%03u.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
-                snprintf(temp_data, 128, "File: %s\nBytes Written: %0lu", file_path, ret_num);
+                snprintf(temp_data, 128, "File: %s\nBytes Written: %0lu\nSample Frequency: %"PRIu32"\nSample Duration: %"PRIu32"\n", file_path, ret_num, sample_frequency, sample_duration);
+                // also include sample frequency and duration!
                 if (append_log_file(data_file, temp_data) == ESP_FAIL) {
                     ESP_LOGE(ADC_COPY_TAG, "Error writing to log_file (%s)", data_file);
                     perror("Error Description");   // prints error message after failed FILE operation
@@ -769,6 +772,11 @@ static void adc_transfer_task(void* args) {
                 ESP_LOGW(ADC_TRANS_TAG, "ret_num (%lu) is larger than buffer size. Result will be truncated to buffer length", ret_num);
                 ret_num = ADC_BUFFER_LEN;   // set return num to buffer size. 
             }
+            // read the 2 lines that aren't needed
+            ret = read_line_file(f, strBuf, 128);   // sample frequency
+            ret = read_line_file(f, strBuf, 128);   // sample duration
+            ret = read_line_file(f, strBuf, 128);   // empty line
+            // error check ret? 
             // now read in result array from sample_file. First line gives size again... either remove it, or make it a fixed # of bytes
             fread(strBuf, 16, sizeof(char), sample_file);
             ESP_LOGD(ADC_TRANS_TAG, "First line of sample_file: %s", strBuf);
@@ -952,6 +960,22 @@ void app_main(void) {
     // use functions defined in rotator_driver.h
     // set velocity ("sv") to 50-70% of max. so 0x32 to 0x48 would be sent as ASCII ('3' + '2', etc. )
     // set jog step size to 0 for continuous ("sj")
+    // init_waveplate_uart();  // initialize the UART for the waveplate
+    // send_waveplate_command("ho", 1, 1);
+    // if (!read_waveplate_response()) {
+    //     ESP_LOGE(MAIN_TAG, "Error returning waveplate to home position");
+    //     // return?
+    // }
+    // send_waveplate_command("sv", 50, 2);    // set speed to 50%
+    // // read response, continue if OK
+    // if (!read_waveplate_response()) {
+    //     ESP_LOGE(MAIN_TAG, "Error setting velocity for waveplate");
+    // }
+    // send_waveplate_command("sj", 0, 8);     // set jog size to 0 for continuous motion
+    // if (!read_waveplate_response()) {
+    //     ESP_LOGE(MAIN_TAG, "Error setting jog step");
+    // }
+
     #pragma endregion
     // // --- I2C LCD ---
     #pragma region 

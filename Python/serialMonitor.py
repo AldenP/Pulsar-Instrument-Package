@@ -10,9 +10,10 @@ from matplotlib import pyplot as plt
 from array import array
 
 # Configure the serial port
-serial_port = 'COM3'  # Change this to your serial port
-baud_rate = 921600      #this can be increased by updating menuconfig UART setup for esp32 chip
-num_samples = 8*1024      # this should match the ADC_BUFFER_LEN from ESP32 code. Currently 8KB
+serial_port :str = 'COM3'  # Change this to your serial port
+baud_rate :int = 921600      #this can be increased by updating menuconfig UART setup for esp32 chip
+# num_samples = 16*1024      # this should match the ADC_BUFFER_LEN from ESP32 code. Currently 8KB
+chunk_size: int = 16*1024       # how much data python will read at once as a chunk.
 
 BEGIN_TAG = b"BEGIN PY READ"    # 'b' is to interpret as binary
 PY_END_TAG = b"END PY SAMPLE"
@@ -22,18 +23,18 @@ VMAX = 960  #mV // max when using 0 attenuations
 DMAX = pow(2, 12) #12 bit resolution
 DEFAULT_DIR = "./adc_data/"
 
-ser = serial.Serial(serial_port, baud_rate, timeout=5)  #5 second timeout on reads
+ser : serial.Serial = serial.Serial(serial_port, baud_rate, timeout=5)  #5 second timeout on reads
 
-sample_freq = 0
-sample_dur = 250
-loopCompletions = 0
-total_read = 0
+sample_freq :int = 0
+sample_dur :int = 250
+loopCompletions :int = 0
+total_read :int = 0
 
-def read_adc_data():
+def read_adc_data() -> dict:
     global loopCompletions
     global total_read
     print("PY > Reading ADC Data\n")
-    adc_raw = dict()    #stores channel as key, and list (or better, an array) as value (data) (or np array)
+    adc_raw :dict[int, array] = dict()    #stores channel as key, and list (or better, an array) as value (data) (or np array)
     # printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read
     line = ser.readline()
     print("PY > " + str(line.strip(), "utf-8"))
@@ -43,7 +44,7 @@ def read_adc_data():
         # ch: #; value: #(in hex)
         # (#),(0x#) // for speed, extra characters are eliminated
         #eventually some kind of time value will be included. Possibly the current clock cycle. 
-        line = ser.readline()
+        line :str = ser.readline()
         if line.strip() == b"PY END":
             print(f"Read end tag: {str(line, encoding='utf-8')}")
             return adc_raw
@@ -71,9 +72,9 @@ def read_adc_data():
     return adc_raw
 
 def read_adc_chunk():
-    """ Reads 8192 bytes from serial 1st and processes it so internal buffer doesn't fill up, resulting in data buffer loss/corruption"""
+    """ Reads `chunk_size` bytes from serial 1st and processes it so internal buffer doesn't fill up; prevents data buffer loss/corruption"""
     global total_read
-    adc_raw = dict()
+    adc_raw :dict[int, array]= dict()
     
     print("PY > Reading in fixed 8192 bytes of data")
     # ESP will first print the number of bytes it is sending ...
@@ -83,9 +84,10 @@ def read_adc_chunk():
     numBytes = line.split(':')[1].strip()    #gets the last index (should be same as 1) and removes whitespace
     print(f"PY > numBytes sent from ESP32: {numBytes}")
 
-    # use numBytes as portion to read, or 8192, whichever is less.
-    chunk = str( ser.read( min(8192, int(numBytes))) , 'utf-8')  # read returns a byte array, convert to utf-8 encoded string
-    partitioned = chunk.split("\r\n")   # don't know if serial will output \r with \n  (CRLF/Windows) or just \n (LF/Unix)
+    # use numBytes as portion to read, or 16 KB, whichever is less. 
+    chunk = str( ser.read( min(chunk_size, int(numBytes))) , 'utf-8')  # read returns a byte array, convert to utf-8 encoded string
+    # the problem is probably the newline characters. Determine how many bytes each line is to determine amount to read. 
+    partitioned :list[str] = chunk.split("\n")   # don't know if serial will output \r with \n  (CRLF/Windows) or just \n (LF/Unix) [probably just LF/Unix]
     # read may cut a line off, and so the 1st split element might need to be removed/sacrificed. 
     for line in partitioned:    # partitioned will have all lines of data. 
         ls = line.split(',') # splits on separator
@@ -118,7 +120,7 @@ def read_adc_chunk():
 #     return pulse_intervals
 
 timeoutCount = 0
-adc_data = list()   # holds dictionaries of the ADC data.
+adc_data :list[dict] = list()   # holds dictionaries of the ADC data.
 # Prep folder for file saving.
 if not os.path.isdir(DEFAULT_DIR):
     os.mkdir(DEFAULT_DIR)
@@ -131,7 +133,7 @@ while True:
         print('Py > Timed Out with no new data (%d)', timeoutCount)  #print to console if timed out
         timeoutCount +=1
 
-    if dataIn.strip() == META_TAG:
+    elif dataIn.strip() == META_TAG:
         # get metadata from serial/ESP32: printf("%s\nfreq: %"PRIu32"; duration: %"PRIu32"\n", PY_DATA, sample_frequency, sample_duration);   //in Hz and ms
         # line = dataIn.split("|")[1].split(";")
         dataIn = ser.readline()
@@ -140,7 +142,7 @@ while True:
         sample_dur = int(line[1].split(b':')[1], base=10)  # ms
         print(f'Py > {sample_freq=}; {sample_dur=}')
 
-    if dataIn.strip() == BEGIN_TAG:   #if input is the data we want, read it in.
+    elif dataIn.strip() == BEGIN_TAG:   #if input is the data we want, read it in.
         # adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values
         adc_data_partial = read_adc_chunk()
         loopCompletions += 1
@@ -162,7 +164,7 @@ while True:
         #     pulse_intervals = calculate_pulse_timing(adc_data[chNum], sampling_rate)
         #     print("Pulse intervals (s):", pulse_intervals)
     
-    if dataIn.strip() == PY_END_TAG:
+    elif dataIn.strip() == PY_END_TAG:
         # export the list of dictionaries into one large dictionary (of chNum->array of data)
         # other way to store data: 2D array of chNum and time or cycles. 
         big_data = adc_data[0]  #should be a dictionary
@@ -186,11 +188,15 @@ while True:
                 # number of elements would help!    - if can't get right value from below, take it from ESP32 log. 
                 fd.write("Array Size: " + str(len(big_data[ch])) + '\n')
 
-                fd.write(str(big_data[chNum]))  #may or may not work
+                fd.write(str(big_data[ch]))  #may or may not work
                 # alternatively, array can be saved to a binary file with .tofile(fd), and then read using .fromfile(fd, # to read)
                 print("PY > file created: ", fileName)
         
         loopCompletions = 0 # reset loop counter
         total_read = 0
     else:
-        print(str(dataIn, encoding='utf-8'), end='')    # using UTF-8 encoding shows the colors of the output. newline in dataIn
+        try:
+            print(str(dataIn, encoding='utf-8'), end='')    # using UTF-8 encoding shows the colors of the output. newline in dataIn
+        except UnicodeDecodeError:
+            print(str(dataIn), end='')
+        

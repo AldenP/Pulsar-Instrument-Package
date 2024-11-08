@@ -4,7 +4,7 @@
 // Define the TX and RX pins for the waveplate communication
 #define WAVEPLATE_TX        GPIO_NUM_21  // Pin 21 for transmitting data (TX)
 #define WAVEPLATE_RX        GPIO_NUM_22  // Pin 22 for receiving data (RX)
-#define UART_NUM            UART_NUM_1       // Use UART1 for communication with the waveplate
+#define WAVE_UART_NUM       UART_NUM_1       // Use UART1 for communication with the waveplate
 #define WAVEPLATE_BAUD_RATE 9600  // Baud rate spec is 9600 for communication speed
 #define WAVEPLATE_ADDR      '0'     // Assume default address of device is '0' 
 // enum for possible error code responses from rotator
@@ -36,13 +36,16 @@ void init_waveplate_uart();
 /**
  * Sends a command to the waveplate via UART.
  * @param command: The command to be sent as a string (e.g., "ROTATE 90\r\n").
+ * @param data: integer of data to be sent, formatted as a hexadecimal number
+ * @param data_len: how many digits the data should take up. If 0, command is sent with no data
  */
-void send_waveplate_command(const char* command, uint8_t data);
+void send_waveplate_command(const char* command, uint8_t data, size_t data_len);
 
 /**
  * Reads the response from the waveplate via UART.
  * The response is printed to the console for debugging or further processing.
+ * @returns: returns the integer code from the waveplate. 
  */
-void read_waveplate_response();
+int read_waveplate_response();
 
 #endif // End of header guard
