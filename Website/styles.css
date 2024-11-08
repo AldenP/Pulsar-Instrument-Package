@@ -69,13 +69,18 @@ p {
     margin-right: 20%;
     padding: 3px;
 
-    text-align: center;
+    text-align: justify;
     border-style: groove;
     border-color: black; 
 }
 #sd2_CDR {
     margin-left: 15%;
     margin-right: 10%;
+    padding: 2px;
+
+    /* border-style: groove; */
+    border-left: ridge skyblue;
+    /* skyblue? */
 }
 #sd2_MT_Demo {
     margin-left: 25%;
@@ -85,6 +90,16 @@ p {
     text-align: center;
     border-style: double;
     border-color: black; 
+}
+#sd2_ConfPaper {
+    margin-right: 30%;
+    margin-left: 10%;
+    padding: 3px;
+
+    text-align: justify;
+    /* border-style: solid; */
+    border-left: 2px solid steelblue;
+
 }
 /* Horizontal Navigation Bar Classes and Styles */
 .navBar {
