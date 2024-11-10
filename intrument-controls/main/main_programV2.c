@@ -26,8 +26,13 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+// NVS
+#include "freertos/semphr.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 //      ----- Pin Assignments -----
+#pragma region 
 #define START_BUT       GPIO_NUM_35     // starts the whole process
 #define AUX_BUT         GPIO_NUM_34     // more of Auxilary button (AUX)
 
@@ -67,6 +72,7 @@
 #define GPIO_OUT_MASK   (1ULL << GREEN_LED | 1ULL << RED_LED | 1ULL << BLUE_LED)
 
 #define ESP_INTR_FLAG_DEFAULT 0     //define flag for gpio ISRs
+#pragma endregion
 // ----- -----
 
 // Simplfy this section later, if possible? 
@@ -91,7 +97,7 @@
 #define DEBOUNCE_TIME_MS    300     // time to wait, in milliseconds, before re-enabling button interrupts
 // naively increase buffer size to permit longer sample duration.
 #define ADC_BUFFER_LEN                  KB_TO_BYTES(16)
-#define DEFAULT_ADC_FREQ                50000 // true default of 1,000,000 Hz
+#define DEFAULT_ADC_FREQ                50000 // true default of 500,000 Hz (500kHz)
 #define DEFAULT_DURATION                250   //ms
 
 // Please consult the datasheet of your servo before changing the following parameters
@@ -123,6 +129,7 @@ static adc_channel_t channel[2] = {ADC_CHANNEL_0, ADC_CHANNEL_1};//{ADC_CHANNEL_
 static size_t num_adc_channels = sizeof(channel) / sizeof(adc_channel_t);
 
 // ----- TASKS -----
+#pragma region 
 // make this large enough to avoid task stack overflows. if too large, scale back, or set it per task 
 #define TASK_STACK_SIZE                 KB_TO_BYTES(8)    //8kB
 static TaskHandle_t main_task_handle = NULL;
@@ -158,6 +165,8 @@ static const char* SERVO_TASK_TAG = "SERVO";
 #define SERVO_TASK_PRIORITY     1
 
 static const char* SD_TAG = "SD-TRANSFER";
+static const char* NVS_TAG = "NVS";
+#pragma endregion
 
 static const char * PY_TAG = "BEGIN PY READ";       // begin reading a segment of ADC_BUFFER_LEN
 static const char * PY_END_TAG = "END PY SAMPLE";   // tag to save partial segments into 1 file 
@@ -170,7 +179,7 @@ volatile bool led_state = false;            //green (debug) LED state
 volatile bool red_led_state = false;        // the status LED
 volatile bool blue_led_state = false;       // the overflow LED
 volatile bool pupil_path_state = false;     // essentially the state of the servos
-static int servo_angle = 0;                 // angle of servos 
+// static int servo_angle = 0;                 // angle of servos 
 // --- menu variables ---
 volatile uint16_t base_pos = 0;     // index of base array. shared between duration and frequency. reset to zero as needed.
 // volatile uint16_t lcd_curPos = 0;   // column position, based on base pos, dependent on menu index. 
@@ -186,19 +195,25 @@ int base[] = {1, 10, 100, 1000, 10000, 100000}; // for modifying the duration/fr
 static size_t baseSize = sizeof(base) / sizeof(int);
 static const char *menuUnit[] = { "kHz", "ms ", "   "}; //third unit is for a yes/no value.
 static const char *servoStatus[] = {"OFF", " ON"};  //default is off, turn on with rot_switch when on this menu.
-// --- ---
-uint8_t adc_conv_buffer[ADC_BUFFER_LEN] = {0};   // result buffer for adc_copy_task; should it be static?
-
-static uint16_t sample_num = 0; // number to set directory name for samples
-#define SAMPLE_LOG_DIR      "/SAMP_LOG"     // folder to hold logs for each sample
-// FILE * sample_files[10];    // arary of FILE pointers (*) used to store list of files from a sample session.
 // ----- -----
 // --- Parameters ---
 uint32_t sample_frequency = DEFAULT_ADC_FREQ;    // default 1MHz frequency
 uint32_t sample_duration = 250;         // default 250ms 
 uint32_t bytes_read = 0;   // no longer changes in ISR context, removed volatile
-// --- ---
 
+uint8_t adc_conv_buffer[ADC_BUFFER_LEN] = {0};   // result buffer for adc_copy_task; should it be static?
+
+static uint16_t sample_num = 0; // number to set directory name for samples
+#define SAMPLE_LOG_DIR      "/SAMP_LOG"     // folder to hold logs for each sample
+// FILE * sample_files[10];    // arary of FILE pointers (*) used to store list of files from a sample session.
+
+// Handle of the wear levelling library instance
+static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
+// Mount path for the internal flash partition
+const char *base_path = "/spiflash";
+
+// NVS Global handle
+static nvs_handle_t my_nvs_handle;
 // ----- LOCKS -----
 // for concurrency issues, spinlocks should be used (easiest solution)
 // static portMUX_TYPE adc_lock = portMUX_INITIALIZER_UNLOCKED;  //spinlock for adc_state
@@ -227,10 +242,50 @@ typedef struct file_data {
     // can add other fields of data as time progresses
 } file_data;
 // ----- -----
-// --- Prototypes ---
+// --- Prototypes (as needed) ---
 static inline uint32_t example_angle_to_compare(int angle);
 static void handle_command(const char* command, void * args);
 // ----- 
+/**
+ * @brief Gets an unsigned, 32-bit integer from NVS with error handling included
+ * 
+ * @returns ESP_OK if integer retrieved successfully; ESP_ERR_NVS_NOT_FOUND - value isn't initialized yet; or another error
+ */
+esp_err_t get_nvs_uint(char* var_name, uint32_t * var) {
+    esp_err_t err = nvs_get_u32(my_nvs_handle, var_name, var);
+    switch (err) {
+        case ESP_OK:
+            ESP_LOGI(NVS_TAG, "Integer from NVS: %s = %"PRIu32"", var_name, *var);
+            // printf("%s = %" PRIu32 "\n", var_name, *var);
+            break;
+        case ESP_ERR_NVS_NOT_FOUND:
+            ESP_LOGW(NVS_TAG, "The NVS value (%s) is not initialized yet!\n", var_name);
+            break;
+        default :
+            ESP_LOGE(NVS_TAG, "Error (%s) reading NVS value!\n", esp_err_to_name(err));
+    }
+    return err;
+}
+/**
+ * @brief Gets a 32-bit integer from NVS with error handling included
+ * 
+ * @returns ESP_OK if integer retrieved successfully; ESP_ERR_NVS_NOT_FOUND - value isn't initialized yet; or another error
+ */
+esp_err_t get_nvs_int(char* var_name, int32_t * var) {
+    esp_err_t err = nvs_get_i32(my_nvs_handle, var_name, var);
+    switch (err) {
+        case ESP_OK:
+            ESP_LOGI(NVS_TAG, "Integer from NVS: %s = %"PRId32"", var_name, *var);
+            // printf("%s = %" PRId32 "\n", var_name, *var);
+            break;
+        case ESP_ERR_NVS_NOT_FOUND:
+            ESP_LOGW(NVS_TAG, "The NVS value (%s) is not initialized yet!\n", var_name);
+            break;
+        default :
+            ESP_LOGE(NVS_TAG, "Error (%s) reading NVS key!\n", esp_err_to_name(err));
+    }
+    return err;
+}
 /**
  * Function that returns (via out pointer) a path for the next file to create to store a result buffer.
  * Uses a global static integer to provide a unique file number each time.
@@ -1099,6 +1154,7 @@ static inline uint32_t example_angle_to_compare(int angle)  {
 
 void app_main(void) {
     esp_err_t ret;  // var to hold return values
+    esp_err_t err;  // other var for the same thing
 
     main_task_handle = xTaskGetCurrentTaskHandle();     // get task handle for main
     // Set log level to allow display of debug-level logging
@@ -1412,8 +1468,52 @@ void app_main(void) {
     uart_enable_pattern_det_baud_intr(PC_UART_NUM, UART_PATTERN_CHAR, PATTERN_CHR_NUM, 9, 0, 0);  // use to set variables (by using synchronous prompts?)
     //Reset the pattern queue length to record at most 20 pattern positions.
     uart_pattern_queue_reset(PC_UART_NUM, 20);
+    uart_flush_input(PC_UART_NUM);  // clear buffer to ensure no garbage in there
     #pragma endregion
+    // Initialize NVS
+#pragma region 
+    ESP_LOGI(MAIN_TAG, "Initializing non-volatile storage (NVS)...");
+    err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // NVS partition was truncated and needs to be erased
+        // Retry nvs_flash_init
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK( err );
 
+    // Open
+    // printf("\n");
+    ESP_LOGI(MAIN_TAG, "Opening Non-Volatile Storage (NVS) handle... ");
+    // nvs_handle_t my_nvs_handle;
+    err = nvs_open("storage", NVS_READWRITE, &my_nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(MAIN_TAG, "Error (%s) opening NVS handle!", esp_err_to_name(err));
+    } else {
+        printf("Done (openning)\n");
+
+        // Read
+        printf("Reading restart counter from NVS ... ");
+        int32_t restart_counter = 0; // value will default to 0, if not set yet in NVS
+        get_nvs_int("restart_counter", &restart_counter);
+        // Write
+        printf("Updating restart counter in NVS ...\n");
+        restart_counter++;
+        err = nvs_set_i32(my_nvs_handle, "restart_counter", restart_counter);
+        printf((err != ESP_OK) ? "Failed!\n" : "Done\n");
+
+        // Commit written value.
+        // After setting any values, nvs_commit() must be called to ensure changes are written
+        // to flash storage. Implementations may write to storage at other times,
+        // but this is not guaranteed.
+        printf("Committing updates in NVS ...\n");
+        err = nvs_commit(my_nvs_handle);
+        printf((err != ESP_OK) ? "Failed!\n" : "Done\n");
+
+        // Close
+        // nvs_close(my_nvs_handle);
+    }
+#pragma endregion
     // create log file folder, if it doesn't already exist
     char tmpBuf[64] = {0};
     sprintf(tmpBuf, "%s%s/", SD_MOUNT, SAMPLE_LOG_DIR);
@@ -1454,7 +1554,7 @@ void app_main(void) {
     // servo task creation
     xTaskCreatePinnedToCore(servo_task, "SERVO-TASK", KB_TO_BYTES(2), (void*)&servo_handles, SERVO_TASK_PRIORITY, &servo_task_handle, tskNO_AFFINITY);
     // UART listening task needs access to the ADC handle, as well as the servo comparators to be passed to other functions.
-    xTaskCreatePinnedToCore(uart_event_task, "UART-LISTEN", KB_TO_BYTES(2), (void*)&handles, UART_RX_TASK_PRIORITY, &uart_monitor_handle, 0);   // cannot be free to run on either core.
+    xTaskCreatePinnedToCore(uart_event_task, "UART-LISTEN", KB_TO_BYTES(2), (void*)&handles, UART_RX_TASK_PRIORITY, &uart_monitor_handle, 0);   // cannot be free to run on core 1.
     
     // set angle of servos to 'off' state
     // servo_angle = SERVO_MIN_DEGREE;
@@ -1541,4 +1641,5 @@ void app_main(void) {
     ESP_LOGI(MAIN_TAG, "Card unmounted");
     lcd1602_deinit(lcd_ctx);
     ESP_LOGI(MAIN_TAG, "LCD deinitialized");
+    nvs_close(my_nvs_handle);
 }

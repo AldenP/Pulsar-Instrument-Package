@@ -128,6 +128,7 @@ if not os.path.isdir(DEFAULT_DIR):
 # wait until a tag appears (like 'py_adc_read') to appear and then start reading the data from adc.
 while True:
     #Reads data as bytes. Will need to convert to char/string then.
+    # userIn: str = input(">>> ")   #will need some something to prevent this from blocking!
     dataIn = ser.readline()    #timeout set by serial object
     if dataIn == b'':
         print('Py > Timed Out with no new data (%d)', timeoutCount)  #print to console if timed out
