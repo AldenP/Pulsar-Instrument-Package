@@ -38,6 +38,7 @@ void init_waveplate_uart() {
 
     // Set the TX and RX pins for UART communication
     uart_set_pin(WAVE_UART_NUM, WAVEPLATE_TX, WAVEPLATE_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    // uart_set_mode(WAVE_UART_NUM, UART_MODE_UART);    // no RS-232 mode, so it must be the default UART
     ESP_LOGI(WAVE_TAG, "Waveplate UART configured");
 }
 

@@ -24,6 +24,7 @@
         "unistd.h": "c",
         "stat.h": "c",
         "sdkconfig.h": "c",
-        "freertosconfig.h": "c"
+        "freertosconfig.h": "c",
+        "uart.h": "c"
     }
 }

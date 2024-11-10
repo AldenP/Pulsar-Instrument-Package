@@ -91,7 +91,8 @@
 #define DEBOUNCE_TIME_MS    300     // time to wait, in milliseconds, before re-enabling button interrupts
 // naively increase buffer size to permit longer sample duration.
 #define ADC_BUFFER_LEN                  KB_TO_BYTES(16)
-#define DEFAULT_ADC_FREQ                20000 // true default of 1,000,000 Hz
+#define DEFAULT_ADC_FREQ                50000 // true default of 1,000,000 Hz
+#define DEFAULT_DURATION                250   //ms
 
 // Please consult the datasheet of your servo before changing the following parameters
 #define SERVO_MIN_PULSEWIDTH_US 500  // Minimum pulse width in microsecond
@@ -102,11 +103,19 @@
 #define SERVO_TIMEBASE_RESOLUTION_HZ 1000000  // 1MHz, 1us per tick
 #define SERVO_TIMEBASE_PERIOD        20000    // 20000 ticks, 20ms
 
+// Angles for the servos when pupil is set to ON or OFF. Servo1 = Front, Servo2 = Back
+#define SERVO1_ON  63
+#define SERVO1_OFF  0
+#define SERVO2_ON  -60
+#define SERVO2_OFF  0
+
 #define SD_MOUNT "/sdcard"  //mount path for SD card
 #define FORMAT_IF_MOUNT_FAILS   true    // this will format the card for the 1st time (if mounting fails).
 #define USE_SD_CARD             true    // used with #ifdef to either print ADC to file (on SD card) or to python/console.
 // define max # of files and unit size? 
 
+#define UART_READ_BUF           512    // buffer size for reading from PC UART channel
+static QueueHandle_t pc_uart_queue;
 // ----- -----
 
 // use channels 0-3 of ADC1 for the ESP32
@@ -125,7 +134,7 @@ static const char *ADC_COPY_TAG = "ADC-COPY";
 
 static TaskHandle_t adc_task_handle = NULL;
 static const char * ADC_TASK_TAG = "ADC-TASK";
-#define ADC_TASK_PRIORITY       2
+#define ADC_TASK_PRIORITY       ((UBaseType_t) 1U)
 
 static TaskHandle_t adc_transfer_handle = NULL; // transfer from SD card to PC over UART
 static const char * ADC_TRANS_TAG = "ADC-TRANSFER";
@@ -136,6 +145,13 @@ static const char * ADC_TRANS_TAG = "ADC-TRANSFER";
 static TaskHandle_t monitor_handle = NULL;
 static const char * MONITOR_TASK_TAG = "MONITOR";
 #define MONITOR_TASK_PRIORITY   tskIDLE_PRIORITY
+
+static TaskHandle_t uart_monitor_handle = NULL;
+static const char * UART_MON_TAG = "UART-RX";
+#define UART_RX_TASK_PRIORITY   0
+#define PC_UART_NUM             UART_NUM_0
+#define UART_PATTERN_CHAR       '\n'
+#define PATTERN_CHR_NUM         (1)
 
 static TaskHandle_t servo_task_handle = NULL;
 static const char* SERVO_TASK_TAG = "SERVO";
@@ -189,24 +205,31 @@ uint32_t bytes_read = 0;   // no longer changes in ISR context, removed volatile
 static portMUX_TYPE param_lock = portMUX_INITIALIZER_UNLOCKED;  //lock for sample parameters, and menu index
 
 // ----- STRUCTURES -----
-// structure to hold any handles (as pointers) that may be needed to be sent to functions
-typedef struct my_handlers_t{
-    adc_continuous_handle_t *adc_handle;
-    gptimer_handle_t *gptimer;
-} my_handlers_t;  
-
+// Structure holds the comparators for the two servos, so that they can be controlled separately (one CW [clockwise], other CCW)
+typedef struct my_servos_t {
+    mcpwm_cmpr_handle_t *comp1;
+    mcpwm_cmpr_handle_t *comp2;
+} my_servos_t;  
+// Holds data for the rotary encoder
 typedef struct my_pcnt_t {
     pcnt_unit_handle_t *pcnt_handle;
     QueueHandle_t *event_queue;
 } my_pcnt_t;
-
+// structure to hold any handles (as pointers) that may be needed to be sent to functions
+typedef struct my_handlers_t{
+    adc_continuous_handle_t *adc_handle;
+    gptimer_handle_t *gptimer;
+    my_servos_t * servos;
+} my_handlers_t;
 typedef struct file_data {
     char* file_path;
     uint32_t result_size;
     // can add other fields of data as time progresses
 } file_data;
 // ----- -----
-static inline uint32_t example_angle_to_compare(int angle); // prototype
+// --- Prototypes ---
+static inline uint32_t example_angle_to_compare(int angle);
+static void handle_command(const char* command, void * args);
 // ----- 
 /**
  * Function that returns (via out pointer) a path for the next file to create to store a result buffer.
@@ -614,6 +637,7 @@ static void adc_copy_task(void* args) {
         char data_file[64] = {'\0'};
         char temp_data[128] = { 0 };
 
+        ESP_LOGD(ADC_COPY_TAG, "Free Heap size: %"PRIu32" B; Min. Free Heap: %"PRIu32" B", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
         // char unit[] = EXAMPLE_ADC_UNIT_STR(EXAMPLE_ADC_UNIT);   //not used (except in an else)
         while (1) {
             ret = adc_continuous_read(*adc_handle, adc_conv_buffer, ADC_BUFFER_LEN, &ret_num, 1);
@@ -802,6 +826,8 @@ static void adc_transfer_task(void* args) {
                 }
             }
             fclose(sample_file);    // release resources
+            // delay to give python some time?
+            vTaskDelay(1000/portTICK_PERIOD_MS);
         }   // while for # of buffer files
         fclose(f);  // close the file to release resources
         // inform python that this sampling period has ended
@@ -812,7 +838,7 @@ static void adc_transfer_task(void* args) {
 // Task to periodically display debug or info messages on variable states, etc. Also updates vars from PCNT events.
 static void monitor_var_task(void* args) {
     ESP_LOGI(MONITOR_TASK_TAG, "Variable Monitoring Task started");
-    my_pcnt_t *user_data = (my_pcnt_t*) args;
+    my_pcnt_t *user_data = (my_pcnt_t*) args;       // get data from args
     // Counts for rotary encoder
     int pulse_count = 0;
     int event_count = 0;    //passed by reference to xQueueReceive
@@ -820,7 +846,7 @@ static void monitor_var_task(void* args) {
         // 1000ms = 1s delay, queue waits for 1s. 
         // vTaskDelay(1000 / portTICK_PERIOD_MS);  // avoid watchdog and spamming of logs.
 
-        // report PCNT count; problem: will only update every second because of delay above. 
+        // report PCNT count; problem: will only update every second because of delay to prevent log spamming. 
         if (xQueueReceive(*(user_data->event_queue), &event_count, 1000/portTICK_PERIOD_MS)) { // blocks for 1s waiting to see if update to counter
             ESP_LOGI(MONITOR_TASK_TAG, "PCNT Event Count: %d", event_count);
             // adjust the relevent parameter
@@ -838,11 +864,13 @@ static void monitor_var_task(void* args) {
             }
             taskEXIT_CRITICAL(&param_lock);
         } else  {  // else print some debugging logs
+            // add some logic to prevent log spam without a delay that affects the other functionality?
             ESP_ERROR_CHECK(pcnt_unit_get_count(*(user_data->pcnt_handle), &pulse_count));
             ESP_LOGI(MONITOR_TASK_TAG, "PCNT Current Count: %d", pulse_count);
-            // debug logs
+            
+            // debug level logs
             // ESP_LOGD(MONITOR_TASK_TAG, "adc_state: %d", adc_state);  // visually shown with LED
-            ESP_LOGI(MONITOR_TASK_TAG, "servo state: %d", pupil_path_state);
+            ESP_LOGD(MONITOR_TASK_TAG, "servo state: %d", pupil_path_state);
             ESP_LOGD(MONITOR_TASK_TAG, "bytes_read: %"PRIu32"", bytes_read);
             ESP_LOGD(MONITOR_TASK_TAG, "menuIndex: %d", menuIndex);     // visually shown on LCD, but good as debug. 
             ESP_LOGD(MONITOR_TASK_TAG, "base_pos: %"PRIu16"", base_pos);    
@@ -852,21 +880,200 @@ static void monitor_var_task(void* args) {
 // Task to service servo updates
 static void servo_task(void* args) {
     // needs comparator to call mcpwm_comparator
-    mcpwm_cmpr_handle_t *comparator = (mcpwm_cmpr_handle_t*) args;
+    my_servos_t *servos = (my_servos_t*) args;
 
     ESP_LOGI(SERVO_TASK_TAG, "Servo task entering loop");
     while(1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);    // wait for notification from ISR
         if (pupil_path_state) {
             ESP_LOGI(SERVO_TASK_TAG, "Pupil Image ON, servos set to max");
-            servo_angle = SERVO_MAX_DEGREE;
-            ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(*comparator, example_angle_to_compare(servo_angle)));
+
+            ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(*(servos->comp1), example_angle_to_compare(SERVO1_ON)));
+            ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(*(servos->comp2), example_angle_to_compare(SERVO2_ON)));
             vTaskDelay(pdMS_TO_TICKS(500));    // give servo time to get to position
         } else {
             ESP_LOGI(SERVO_TASK_TAG, "Pupil Image OFF, servos set to min");
-            servo_angle = SERVO_MIN_DEGREE;
-            ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(*comparator, example_angle_to_compare(servo_angle)));
+
+            ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(*(servos->comp1), example_angle_to_compare(SERVO1_OFF)));
+            ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(*(servos->comp2), example_angle_to_compare(SERVO2_OFF)));
             vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+}
+
+// Task function to monitor UART events and handle received data
+static void uart_event_task(void *pvParameters) {
+    ESP_LOGI(UART_MON_TAG, "UART event task created successfully");
+    uart_event_t event;                            // UART event structure to hold event data
+    char* dtmp = (char*) malloc(UART_READ_BUF);   // Allocate buffer for incoming data
+    char* tmpStr = (char*) calloc(UART_READ_BUF, sizeof(char)); // holds the string that will be built up
+    char *pStr = tmpStr;
+
+    while (1) {                                    // Loop to continuously listen for UART events
+        // Wait for an event on the UART queue
+        if (xQueueReceive(pc_uart_queue, (void *)&event, (TickType_t)portMAX_DELAY)) {
+            bzero(dtmp, UART_READ_BUF);                 // Clear the buffer
+
+            switch (event.type) {                  // Check the type of UART event
+                case UART_DATA:                    // If data is received
+                    // Read the incoming data into the buffer
+                    esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_WARN);  // reduce log statements
+                    uart_read_bytes(PC_UART_NUM, dtmp, event.size, portMAX_DELAY);  // only ever reads 1 byte at once (even CRLF is split!)
+                    dtmp[event.size] = '\0';       // Null-terminate the string
+                    printf("Received %u bytes: %s (%X)\n", event.size, (char*) dtmp, dtmp[0]);  // Print received data
+                    // build up a buffer until a newline character. (if event.size is 1)
+                    // actually recieves CRLF (\r\n)
+                    if (dtmp[0] == '\r') {
+                        // process command
+                        handle_command(tmpStr, pvParameters);   // handle the command
+                        memset(tmpStr, 0, UART_READ_BUF);   // clear the tmpStr
+                        pStr = tmpStr;
+                        esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);     // restore log level
+                        break;
+                    }
+                    // else add dtmp to tmpStr
+                    // strcat(tmpStr, (char*) dtmp);
+                    *pStr = dtmp[0];
+                    pStr += 1;  // move pointer address up by 1 (to next position in string)
+                    printf("tmpStr: %s\n", tmpStr);
+                    // handle_command((char*) dtmp, pvParameters);  // Pass received data to command handler
+                    break;
+                case UART_PATTERN_DET:
+                    // Pattern is detected. use this to detect '\n' and then read line at once?
+                    ESP_LOGI(UART_MON_TAG, "UART pattern detect event reached");
+                    size_t len = 0;
+                    uart_get_buffered_data_len(PC_UART_NUM, &len);
+                    uart_read_bytes(PC_UART_NUM, dtmp, len, 0);
+                    dtmp[len] = 0;  // give string its null-termination
+                    handle_command(dtmp, pvParameters);
+                    break;
+            #pragma region 
+                case UART_FIFO_OVF:                // If UART FIFO buffer overflows
+                    printf("UART FIFO Overflow\n");
+                    uart_flush_input(PC_UART_NUM);    // Clear input buffer
+                    xQueueReset(pc_uart_queue);       // Reset the UART queue
+                    break;
+
+                case UART_BUFFER_FULL:             // If UART buffer is full
+                    printf("UART Buffer Full\n");
+                    uart_flush_input(PC_UART_NUM);    // Clear input buffer
+                    xQueueReset(pc_uart_queue);       // Reset the UART queue
+                    break;
+
+                case UART_BREAK:                   // If a UART break condition occurs
+                    printf("UART Break detected\n");
+                    break;
+
+                case UART_PARITY_ERR:              // If a parity error occurs
+                    printf("UART Parity Error\n");
+                    break;
+
+                case UART_FRAME_ERR:               // If a frame error occurs
+                    printf("UART Frame Error\n");
+                    break;
+
+                default:                           // For any unknown UART event type
+                    printf("Unknown UART event type: %d\n", event.type);
+                    break;
+            #pragma endregion
+            }
+        }
+    }
+    // free(tmpStr);
+    free(dtmp);                                    // Free the allocated memory for the buffer
+    vTaskDelete(NULL);                             // Delete this task when done
+}
+
+// Command is string from console, args are handles for starting different tasks
+static void handle_command(const char* command, void* args) {
+    my_handlers_t * handles = (my_handlers_t*) args;
+    adc_continuous_handle_t * adc_handle = handles->adc_handle;
+    // my_servos_t * servos = handles->servos;
+
+    if (strcmp(command, "start") == 0) {           // Check if the command is "start"
+        printf("Received 'start' command. Beginning operation...\n");
+        // --- Add code here for start operation (simulate button press?)
+        // provide visual output of command input (flash LED)
+        led_state = !led_state;
+        gpio_set_level(GREEN_LED, led_state);
+        vTaskDelay(500/portTICK_PERIOD_MS);
+        led_state = !led_state;
+        gpio_set_level(GREEN_LED, led_state);
+        
+        // first see if ADC is off, and check that handle is null (both should follow each other)
+        if (!adc_state && (*adc_handle == NULL)) {
+            // notify the adc task to initialize adc module, and start sampling.
+            xTaskNotifyGive(adc_task_handle);
+        }   //else it is already running, don't do anything.
+    } else if (strcmp(command, "pupil") == 0) {
+        pupil_path_state = !pupil_path_state;
+        ESP_LOGI(UART_MON_TAG, "Recieved Pupil Command, servo state: %s", (pupil_path_state) ? "ON":"OFF" );
+        // notify servo task
+        xTaskNotifyGive(servo_task_handle);
+    } else if (strcmp(command, "reset samples") == 0) {
+        ESP_LOGI(UART_MON_TAG, "Resetting sample sector memory address (old sample data will be overwritten)");
+        // TODO: nvs_set_i32("sample_start", STARTING_SECTOR);
+        
+    } else {    // If the command is more advanced, or unknown
+        // split string on space, see if left is "set", "setf", or "setd"
+        char* token = strtok(command, " "); // tokenize based on space
+        // set <freq [kHz]> <dur [ms]>
+/*set*/ if (token != NULL && strcmp(token, "set") == 0) {
+            token = strtok(NULL, " ");
+            if (token == NULL) {
+                ESP_LOGW(UART_MON_TAG, "Invalid argument for \"set\" command. Usage: \"set <freq [kHz]> <dur [ms]>\"");
+                return;
+            }   // else not NULL
+            int ret = sscanf(token, "%"PRIu32"", &sample_frequency);
+            if (ret < 1) {
+                ESP_LOGE(UART_MON_TAG, "Invalid frequency for \"set\" command (%s).", token);
+                sample_frequency = DEFAULT_ADC_FREQ;
+                return;
+            }   // otherwise, integer read sucessfully
+            // part 2, read the duration
+            token = strtok(NULL, " ");
+            if (token == NULL) {
+                ESP_LOGW(UART_MON_TAG, "Invalid argument for \"set\" command. Usage: \"set <freq [kHz]> <dur [ms]>\"");
+                sample_duration = DEFAULT_DURATION;
+                return;
+            }   // else not NULL
+            ret = sscanf(token, "%"PRIu32"", &sample_duration);
+            if (ret < 1) {
+                ESP_LOGE(UART_MON_TAG, "Invalid duration for \"set\" command (%s).", token);
+            }
+
+            ESP_LOGI(UART_MON_TAG, "Command read correctly, sample_frequency = %"PRIu32"; sample_duration = %"PRIu32"",
+                            sample_frequency, sample_duration);
+/*setf*/} else if (token != NULL && strcmp(token, "setf") == 0) {
+            token = strtok(NULL, " ");
+            if (token == NULL) {
+                ESP_LOGW(UART_MON_TAG, "Invalid argument for \"setf\" command. Usage: \"setf <freq [kHz]>\"");
+                return;
+            }   // else not NULL
+            int ret = sscanf(token, "%"PRIu32"", &sample_frequency);
+            if (ret < 1) {
+                ESP_LOGE(UART_MON_TAG, "Invalid frequency for \"setf\" command (%s).", token);
+                sample_frequency = DEFAULT_ADC_FREQ;
+                return;
+            }   // otherwise, integer read sucessfully
+
+            ESP_LOGI(UART_MON_TAG, "Command read correctly, sample_frequency = %"PRIu32"", sample_frequency);
+/*setd*/} else if (token != NULL && strcmp(token, "setd") == 0) {
+            token = strtok(NULL, " ");
+            if (token == NULL) {
+                ESP_LOGW(UART_MON_TAG, "Invalid argument for \"setd\" command. Usage: \"setd <dur [ms]>\"");
+                return;
+            }   // else not NULL
+            int ret = sscanf(token, "%"PRIu32"", &sample_duration);
+            if (ret < 1) {
+                ESP_LOGE(UART_MON_TAG, "Invalid duration for \"setd\" command (%s).", token);
+                sample_duration = DEFAULT_DURATION;
+                return;
+            }   // otherwise, integer read sucessfully
+
+            ESP_LOGI(UART_MON_TAG, "Command read correctly, sample_duration = %"PRIu32"", sample_duration);
+/*else*/} else {
+            ESP_LOGW(UART_MON_TAG, "Unknown command received: \"%s\"", command);
         }
     }
 }
@@ -1085,33 +1292,38 @@ void app_main(void) {
     ESP_ERROR_CHECK(mcpwm_new_timer(&timer_config, &timer));
    
     mcpwm_oper_handle_t oper = NULL;
+    mcpwm_oper_handle_t oper2 = NULL;
     mcpwm_operator_config_t operator_config = {
         .group_id = 0, // operator must be in the same group to the timer
     };
     ESP_ERROR_CHECK(mcpwm_new_operator(&operator_config, &oper));
+    ESP_ERROR_CHECK(mcpwm_new_operator(&operator_config, &oper2));
 
     ESP_LOGI(MAIN_TAG, "MCPWM: Connect timer and operator");
     ESP_ERROR_CHECK(mcpwm_operator_connect_timer(oper, timer));
+    ESP_ERROR_CHECK(mcpwm_operator_connect_timer(oper2, timer));
 
     ESP_LOGI(MAIN_TAG, "MCPWM: Create comparator and generator from the operator");
-    mcpwm_cmpr_handle_t comparator = NULL;
+    mcpwm_cmpr_handle_t comparator1 = NULL;
+    mcpwm_cmpr_handle_t comparator2 = NULL;
     mcpwm_comparator_config_t comparator_config = {
         .flags.update_cmp_on_tez = true,
     };
-    ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &comparator_config, &comparator));
+    ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &comparator_config, &comparator1));
+    ESP_ERROR_CHECK(mcpwm_new_comparator(oper2, &comparator_config, &comparator2));
 
     mcpwm_gen_handle_t generator1 = NULL;
+    mcpwm_gen_handle_t generator2 = NULL;
     mcpwm_generator_config_t generator_config = {
         .gen_gpio_num = SERVO_1,
     };
     ESP_ERROR_CHECK(mcpwm_new_generator(oper, &generator_config, &generator1));
-    
-    mcpwm_gen_handle_t generator2 = NULL;
     generator_config.gen_gpio_num = SERVO_2;
-    ESP_ERROR_CHECK(mcpwm_new_generator(oper, &generator_config, &generator2));
+    ESP_ERROR_CHECK(mcpwm_new_generator(oper2, &generator_config, &generator2));
 
     // set the initial compare value, so that the servo will spin to the center position
-    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(comparator, example_angle_to_compare(0)));
+    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(comparator1, example_angle_to_compare(0)));
+    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(comparator2, example_angle_to_compare(0)));
 
     ESP_LOGI(MAIN_TAG, "MCPWM: Set generator action on timer and compare event");
     // go high on counter empty - servo 1
@@ -1119,14 +1331,14 @@ void app_main(void) {
                     MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
     // go low on compare threshold - servo 1
     ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(generator1,
-                    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparator, MCPWM_GEN_ACTION_LOW)));
+                    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparator1, MCPWM_GEN_ACTION_LOW)));
 
     // go high on counter empty - servo 2
     ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(generator2,
                     MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
     // go low on compare threshold  - servo 2
     ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(generator2,
-                    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparator, MCPWM_GEN_ACTION_LOW)));
+                    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparator1, MCPWM_GEN_ACTION_LOW)));
 
     ESP_LOGI(MAIN_TAG, "MCPWM: Enable and start timer");
     ESP_ERROR_CHECK(mcpwm_timer_enable(timer));
@@ -1175,6 +1387,32 @@ void app_main(void) {
     sdmmc_card_print_info(stdout, card_handle); // prints info on the SD card connected
     // ESP_LOGW(MAIN_TAG, "SD card not yet implemented, filesystem NOT mounted!");
     #pragma endregion
+    // --- PC UART Monitor ---
+    #pragma region
+        /* Configure parameters of an UART driver,
+     * communication pins and install the driver */
+    uart_config_t uart_config = {
+        .baud_rate = 921600,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    //Install UART driver, and get the queue. - don't use TX buffer
+    uart_driver_install(PC_UART_NUM, UART_READ_BUF * 2, 0, 20, &pc_uart_queue, 0);
+    uart_param_config(PC_UART_NUM, &uart_config);
+
+    //Set UART log level
+    esp_log_level_set(UART_MON_TAG, ESP_LOG_INFO);
+    //Set UART pins (using UART0 default pins ie no changes.)
+    uart_set_pin(PC_UART_NUM, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    //Set uart pattern detect function.
+    uart_enable_pattern_det_baud_intr(PC_UART_NUM, UART_PATTERN_CHAR, PATTERN_CHR_NUM, 9, 0, 0);  // use to set variables (by using synchronous prompts?)
+    //Reset the pattern queue length to record at most 20 pattern positions.
+    uart_pattern_queue_reset(PC_UART_NUM, 20);
+    #pragma endregion
 
     // create log file folder, if it doesn't already exist
     char tmpBuf[64] = {0};
@@ -1188,10 +1426,16 @@ void app_main(void) {
 
     adc_continuous_handle_t handle = NULL;  //needed in many places, hold it here for distribution.
 
+    my_servos_t servo_handles = {
+        .comp1 = &comparator1,
+        .comp2 = &comparator2,
+    };
     my_handlers_t handles = {
         .adc_handle = &handle,
         .gptimer = &timer_handle,
+        .servos = &servo_handles,
     };
+    ESP_LOGI(MAIN_TAG, "Installing GPIO ISRs, then creating tasks");
     // Install GPIO ISRs
     gpio_isr_handler_add(START_BUT, start_isr_handler, (void*)&handles);
     gpio_isr_handler_add(AUX_BUT, aux_isr_handler, (void*)&handles);
@@ -1206,13 +1450,16 @@ void app_main(void) {
     // Task that updates the lcd periodically. Cannot be preempted by other tasks when setting LCD display. Will scroll if interrupted.
     // xTaskCreate(lcd_task, "LCD-TASK", TASK_STACK_SIZE, lcd_ctx, 2, &lcd_task_handle);   // perhaps scrolling effect is caused by getting kicked off of CPU. increased priority
     // Task for updating variables from PCNT events, and printing log messages.
-    xTaskCreatePinnedToCore(monitor_var_task, "MONITOR-TASK", TASK_STACK_SIZE, (void*)&monitor_data, MONITOR_TASK_PRIORITY, &monitor_handle, 0);
+    xTaskCreatePinnedToCore(monitor_var_task, "MONITOR-TASK", KB_TO_BYTES(2), (void*)&monitor_data, MONITOR_TASK_PRIORITY, &monitor_handle, 0);
     // servo task creation
-    xTaskCreatePinnedToCore(servo_task, "SERVO-TASK", TASK_STACK_SIZE, (void*)&comparator, SERVO_TASK_PRIORITY, &servo_task_handle, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(servo_task, "SERVO-TASK", KB_TO_BYTES(2), (void*)&servo_handles, SERVO_TASK_PRIORITY, &servo_task_handle, tskNO_AFFINITY);
+    // UART listening task needs access to the ADC handle, as well as the servo comparators to be passed to other functions.
+    xTaskCreatePinnedToCore(uart_event_task, "UART-LISTEN", KB_TO_BYTES(2), (void*)&handles, UART_RX_TASK_PRIORITY, &uart_monitor_handle, 0);   // cannot be free to run on either core.
     
     // set angle of servos to 'off' state
-    servo_angle = SERVO_MIN_DEGREE;
-    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(comparator, example_angle_to_compare(servo_angle)));
+    // servo_angle = SERVO_MIN_DEGREE;
+    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(comparator1, example_angle_to_compare(SERVO1_OFF)));
+    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(comparator2, example_angle_to_compare(SERVO2_OFF)));
     //Add delay, since it takes time for servo to rotate, usually 200ms/60degree rotation under 5V power supply
     vTaskDelay(pdMS_TO_TICKS(500));
 
