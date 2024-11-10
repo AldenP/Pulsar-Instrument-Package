@@ -129,7 +129,7 @@ static QueueHandle_t pc_uart_queue;
 // ----- -----
 
 // use channels 0-3 of ADC1 for the ESP32
-static adc_channel_t channel[2] = {ADC_CHANNEL_0, ADC_CHANNEL_1};//{ADC_CHANNEL_0, ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_3}; //don't forget size
+static adc_channel_t channel[4] = {ADC_CHANNEL_0, ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_3}; //don't forget size
 static size_t num_adc_channels = sizeof(channel) / sizeof(adc_channel_t);
 
 // ----- TASKS -----
@@ -762,16 +762,17 @@ static void adc_task(void* args) {
 
         // save sample_start_sector in a file with sample num. requires total number of sectors written
         snprintf(log_file, 128, "%s/samp%03lu.txt", base_path, sample_num);
-        snprintf(temp_data, 256, "sample_num:%lu\nstart_sector:%lu\nnum_sectors:%lu\n", sample_num, 
-                sample_start_sector, (sample_sector - sample_start_sector)); // end - start = total sectors written
+        snprintf(temp_data, 256, "sample_num:%lu\nstart_sector:%lu\nnum_sectors:%lu\nsample_freq:%lu\nsample_duration:%lu\n",
+                sample_num, sample_start_sector, (sample_sector - sample_start_sector), /* end - start = total sectors written */
+                sample_frequency, sample_duration);     // now includes the frequency and duration. Important metadata!
         ESP_LOGD(ADC_TASK_TAG, "log_file: %s\ntemp_data: %s", log_file, temp_data);     // log debug information
 
         err = append_log_file(log_file, temp_data);   // log/write the information to the file.
         if (err == ESP_FAIL) {
             ESP_LOGE(ADC_TASK_TAG, "Failed to open and write to log file (%s). Sample sector address not saved!", log_file);
-            
             continue;
         }
+
         // else it was successful
         ESP_LOGI(ADC_TASK_TAG, "Sample #%lu address saved to flash successfully", sample_num);
         // update sample_start_sector for next time
