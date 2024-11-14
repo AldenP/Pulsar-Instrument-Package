@@ -53,7 +53,7 @@
 // SD card pins - also 3.3V and GND connection. (3.3V is important)
 #define SD_CMD          GPIO_NUM_15     // brown wire
 #define SD_CLK          GPIO_NUM_14     // white wire
-#define SD_DETECT       GPIO_NUM_23     // gray wire - when high, SD card is inserted. Hardwire an LED --> loading effect drops voltage to ~1.7V
+#define SD_DETECT       GPIO_NUM_19     // gray wire - when high, SD card is inserted. Hardwire an LED --> loading effect drops voltage to ~1.7V
 // --- Data Lines ---
 #define SD_DAT0         GPIO_NUM_2      // blue wire
 #define SD_DAT1         GPIO_NUM_4      // green wire
@@ -66,10 +66,11 @@
 #define GREEN_LED       GPIO_NUM_0      // General debug LED (button presses)
 #define RED_LED         GPIO_NUM_5      // ADC on/off status LED
 #define BLUE_LED        GPIO_NUM_18     // ADC overflow LED
+#define SD_LED          GPIO_NUM_23     // SD detect LED
 
 // Convient Masks for inputs and outputs when configuraing GPIO.
 #define GPIO_IN_MASK    (1ULL << START_BUT | 1ULL << AUX_BUT | 1ULL << ROTARY_SWITCH) // | 1ULL << SD_DETECT)
-#define GPIO_OUT_MASK   (1ULL << GREEN_LED | 1ULL << RED_LED | 1ULL << BLUE_LED)
+#define GPIO_OUT_MASK   (1ULL << GREEN_LED | 1ULL << RED_LED | 1ULL << BLUE_LED || 1ULL << SD_LED)
 
 #define ESP_INTR_FLAG_DEFAULT 0     //define flag for gpio ISRs
 #pragma endregion
@@ -383,7 +384,7 @@ static esp_err_t read_line_file(FILE* fp, char * out, size_t max_length) {
     // *cough* strchr(string, '\n') will return pointer/position of first occurance of '\n'...
     for (i = 0; i < max_length -1; i++) {
         int ch = fgetc(fp);
-        printf("in 'read_line_file': ch: %c, 0x%X\n", ch, ch);
+        // printf("in 'read_line_file': ch: %c, 0x%X\n", ch, ch);
         if (ch == '\n') {
             // stop b/c of newline. b/c using a file, file cursor keeps position.
             break;
@@ -1052,6 +1053,7 @@ static void adc_transfer_task(void* args) {
         }
 
         size_t step_sectors = ADC_BUFFER_LEN / 512, transferred = 0;    // step_sectors = number of sectors per 16 kB buffer (ADC_BUF_LEN)
+        ret_num = ADC_BUFFER_LEN;
         // loop from starting sector to the last sector by tracking the number of sectors transferred thus far.
         for (; transferred < num_sectors; d_start += step_sectors, transferred += step_sectors) {
             ret = sdmmc_read_sectors(card, result_buf, d_start, step_sectors);  // make a macro for sector size? 
@@ -1295,7 +1297,7 @@ static void uart_event_task(void *pvParameters) {
                     size_t len = 0;
                     uart_get_buffered_data_len(PC_UART_NUM, &len);
                     uart_read_bytes(PC_UART_NUM, dtmp, len, 0);
-                    dtmp[len] = 0;  // give string its null-termination
+                    dtmp[len-1] = 0;  // give string its null-termination (removing the newline)
                     handle_command(dtmp, pvParameters);
                     break;
             #pragma region 
@@ -1367,6 +1369,11 @@ static void handle_command(const char* command, void* args) {
         nvs_set_u32(my_nvs_handle, SAMPLE_NUM_NVS, 0);
         nvs_commit(my_nvs_handle);
         // also remove flash log files? technically those are still valid (until the data is overwritten)
+        // TODO: unmount, reformat, and remount flash.
+        // esp_vfs_fat_spiflash_unmount_rw_wl
+        ESP_LOGI(UART_MON_TAG, "Reformatting SPI flash storage...");
+        esp_vfs_fat_spiflash_format_rw_wl(base_path, "storage");
+        ESP_LOGI(UART_MON_TAG, "... formatting finished. Flash mounted.");
         
     } else if(strcmp(command, "suppress") == 0) {
         ESP_LOGI(UART_MON_TAG, "Supressing all logs to WARN level, and some to INFO.");
@@ -1383,7 +1390,7 @@ static void handle_command(const char* command, void* args) {
 /*set*/ if (token != NULL && strcmp(token, "set") == 0) {
             token = strtok(NULL, " ");
             if (token == NULL) {
-                ESP_LOGW(UART_MON_TAG, "Invalid argument for \"set\" command. Usage: \"set <freq [kHz]> <dur [ms]>\"");
+                ESP_LOGW(UART_MON_TAG, "Invalid argument for \"set\" command. Usage: \"set <freq [Hz]> <dur [ms]>\"");
                 return;
             }   // else not NULL
             int ret = sscanf(token, "%"PRIu32"", &sample_frequency);
@@ -1543,8 +1550,10 @@ void app_main(void) {
 
     gpio_config(&io_conf);
     // Change default settings for SD card detect.
-    // gpio_pullup_dis(SD_DETECT);     // disable the default pullup for SD_detect
-    // gpio_pulldown_en(SD_DETECT);    // active high, means it must be GND for off (pulldown). -- handled by breakout board
+    gpio_reset_pin(SD_DETECT);
+    gpio_pullup_dis(SD_DETECT);     // disable the default pullup for SD_detect
+    gpio_pulldown_en(SD_DETECT);    // active high, means it must be GND for off (pulldown). -- handled by breakout board?
+    gpio_set_direction(SD_DETECT, GPIO_MODE_INPUT);
     // -- gpio outputs
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -1557,6 +1566,7 @@ void app_main(void) {
     gpio_set_level(RED_LED, 0);
     gpio_set_level(GREEN_LED, 0);
     gpio_set_level(BLUE_LED, 0);
+    gpio_set_level(SD_LED, 0);
     
     ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT));    //enable ISRs to be added.
     // ----------
@@ -1998,15 +2008,17 @@ void app_main(void) {
             lcd1602_string(lcd_ctx, strBuf);
         }
         // check if SD card is inserted or not, if not, display a message, else ... temporarily display one? 
-        // if (gpio_get_level(SD_DETECT) == 0) {
-        //     snprintf(strBuf, 22, " %-20s", "No SD Card Inserted!");
-        //     lcd1602_set_cursor(lcd_ctx, 0, 19);
-        //     lcd1602_string(lcd_ctx, strBuf);
-        // }  else {   //else clear that line!
-        //     snprintf(strBuf, 22, " %s", BLANK_LINE);
-        //     lcd1602_set_cursor(lcd_ctx, 0, 19);
-        //     lcd1602_string(lcd_ctx, strBuf);
-        // } 
+        if (gpio_get_level(SD_DETECT) == 0) {
+            snprintf(strBuf, 22, " %-20s", "No SD Card Inserted!");
+            gpio_set_level(SD_LED, 0);
+            lcd1602_set_cursor(lcd_ctx, 0, 19);
+            lcd1602_string(lcd_ctx, strBuf);
+        }  else {   //else clear that line!
+            gpio_set_level(SD_LED, 1);
+            snprintf(strBuf, 22, " %s", BLANK_LINE);
+            lcd1602_set_cursor(lcd_ctx, 0, 19);
+            lcd1602_string(lcd_ctx, strBuf);
+        } 
         // change menu based on menu index, and display the appropriate value
         if (menuIndex == 0) {           //frequency
             lcd1602_set_cursor(lcd_ctx, 0, 1);
