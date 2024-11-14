@@ -53,7 +53,7 @@
 // SD card pins - also 3.3V and GND connection. (3.3V is important)
 #define SD_CMD          GPIO_NUM_15     // brown wire
 #define SD_CLK          GPIO_NUM_14     // white wire
-#define SD_DETECT       GPIO_NUM_23     // gray wire - when high, SD card is inserted. Hardwire an LED --> loading effect drops voltage to ~1.7V
+#define SD_DETECT       GPIO_NUM_19     // gray wire - when high, SD card is inserted. Hardwire an LED --> loading effect drops voltage to ~1.7V
 // --- Data Lines ---
 #define SD_DAT0         GPIO_NUM_2      // blue wire
 #define SD_DAT1         GPIO_NUM_4      // green wire
@@ -66,10 +66,11 @@
 #define GREEN_LED       GPIO_NUM_0      // General debug LED (button presses)
 #define RED_LED         GPIO_NUM_5      // ADC on/off status LED
 #define BLUE_LED        GPIO_NUM_18     // ADC overflow LED
+#define SD_LED          GPIO_NUM_23     // SD detect LED
 
 // Convient Masks for inputs and outputs when configuraing GPIO.
 #define GPIO_IN_MASK    (1ULL << START_BUT | 1ULL << AUX_BUT | 1ULL << ROTARY_SWITCH) // | 1ULL << SD_DETECT)
-#define GPIO_OUT_MASK   (1ULL << GREEN_LED | 1ULL << RED_LED | 1ULL << BLUE_LED)
+#define GPIO_OUT_MASK   (1ULL << GREEN_LED | 1ULL << RED_LED | 1ULL << BLUE_LED || 1ULL << SD_LED)
 
 #define ESP_INTR_FLAG_DEFAULT 0     //define flag for gpio ISRs
 #pragma endregion
@@ -100,6 +101,8 @@
 #define DEFAULT_ADC_FREQ                50000 // true default of 500,000 Hz (500kHz)
 #define DEFAULT_DURATION                250   //ms
 
+// Servos
+#pragma region 
 // Please consult the datasheet of your servo before changing the following parameters
 #define SERVO_MIN_PULSEWIDTH_US 500  // Minimum pulse width in microsecond
 #define SERVO_MAX_PULSEWIDTH_US 2500  // Maximum pulse width in microsecond
@@ -114,10 +117,12 @@
 #define SERVO1_OFF  0
 #define SERVO2_ON  -60
 #define SERVO2_OFF  0
+#pragma endregion
 
 #define SD_MOUNT "/sdcard"  //mount path for SD card
 #define FORMAT_IF_MOUNT_FAILS   true    // this will format the card for the 1st time (if mounting fails).
-#define USE_SD_CARD             true    // used with #ifdef to either print ADC to file (on SD card) or to python/console.
+#define USE_SD_CARD             false    // used with #ifdef to either print ADC to file (on SD card) or to python/console.
+#define USE_RAW_SD              true
 // define max # of files and unit size? 
 
 #define UART_READ_BUF           512    // buffer size for reading from PC UART channel
@@ -125,7 +130,7 @@ static QueueHandle_t pc_uart_queue;
 // ----- -----
 
 // use channels 0-3 of ADC1 for the ESP32
-static adc_channel_t channel[2] = {ADC_CHANNEL_0, ADC_CHANNEL_1};//{ADC_CHANNEL_0, ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_3}; //don't forget size
+static adc_channel_t channel[4] = {ADC_CHANNEL_0, ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_3}; //don't forget size
 static size_t num_adc_channels = sizeof(channel) / sizeof(adc_channel_t);
 
 // ----- TASKS -----
@@ -199,21 +204,33 @@ static const char *servoStatus[] = {"OFF", " ON"};  //default is off, turn on wi
 // --- Parameters ---
 uint32_t sample_frequency = DEFAULT_ADC_FREQ;    // default 1MHz frequency
 uint32_t sample_duration = 250;         // default 250ms 
-uint32_t bytes_read = 0;   // no longer changes in ISR context, removed volatile
+volatile uint32_t bytes_read = 0;   // no longer changes in ISR context, removed volatile. except volatile is used more than just from ISRs
 
 uint8_t adc_conv_buffer[ADC_BUFFER_LEN] = {0};   // result buffer for adc_copy_task; should it be static?
 
-static uint16_t sample_num = 0; // number to set directory name for samples
+// NVS Global handle
+static nvs_handle_t my_nvs_handle;
+// SD raw access helper variables
+#define DEFAULT_STARTING_SECTOR     8*512
+static uint32_t sample_start_sector = DEFAULT_STARTING_SECTOR;  // holds the starting sector address for a sample. changes as more samples created
+volatile uint32_t sample_sector = DEFAULT_STARTING_SECTOR;    // the sector address that changes during execution. sample_start_sector stays same during sample run.
+volatile uint32_t sample_num = 0; // number to set directory or file name for samples. potentially change to 32-bit to use with current NVS functions
+#define SAMPLE_NUM_NVS      "sample_num"
+#define SAMPLE_START_NVS    "start_sector"   // ah, limited to 16 characters (including \0). 
+// SD card initialization vars
+static sdmmc_host_t host_g;
+static sdmmc_slot_config_t slot_config_g;
+// SPI Flash FATFS setup (to store information on each sample)
+static wl_handle_t s_wl_handle = WL_INVALID_HANDLE; // Handle of the wear levelling library instance
+const char *base_path = "/spiflash";    // Mount path for the internal flash partition
+const char *FLASH_TAG = "FLASH-IO";
+#define EX_FILE_LEN     256
+
+#define SUPPRESS_LEVEL  ESP_LOG_DEBUG       // level to use for the 'suppress' command. Monitor always at WARN level. 
+volatile bool logs_suppressed = false;      // bool to tell if logs are suppressed or not 
 #define SAMPLE_LOG_DIR      "/SAMP_LOG"     // folder to hold logs for each sample
 // FILE * sample_files[10];    // arary of FILE pointers (*) used to store list of files from a sample session.
 
-// Handle of the wear levelling library instance
-static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
-// Mount path for the internal flash partition
-const char *base_path = "/spiflash";
-
-// NVS Global handle
-static nvs_handle_t my_nvs_handle;
 // ----- LOCKS -----
 // for concurrency issues, spinlocks should be used (easiest solution)
 // static portMUX_TYPE adc_lock = portMUX_INITIALIZER_UNLOCKED;  //spinlock for adc_state
@@ -235,6 +252,7 @@ typedef struct my_handlers_t{
     adc_continuous_handle_t *adc_handle;
     gptimer_handle_t *gptimer;
     my_servos_t * servos;
+    sdmmc_card_t * card;
 } my_handlers_t;
 typedef struct file_data {
     char* file_path;
@@ -245,6 +263,8 @@ typedef struct file_data {
 // --- Prototypes (as needed) ---
 static inline uint32_t example_angle_to_compare(int angle);
 static void handle_command(const char* command, void * args);
+static void suppress_logs(esp_log_level_t general_level);
+static void unsuppress_logs(esp_log_level_t global_level);
 // ----- 
 /**
  * @brief Gets an unsigned, 32-bit integer from NVS with error handling included
@@ -304,7 +324,7 @@ static esp_err_t get_file_path(char * out, /*uint16_t ch_num,*/ uint16_t fileNum
     // assign to the buffer provided (out points to the 1st array element)
     // path is /sdmcard/(cycles since reset / 100,000 [to reduce the number/path length])/(filenumber).dat
     // snprintf(out, 63, "%s/SAMPLE%02u/ch%"PRIu16"_%"PRIu16".dat", SD_MOUNT, sample_num, ch_num, fileNum); //increment after
-    snprintf(out, 63, "%s/SAMPLE%02u/%08u.dat", SD_MOUNT, sample_num, fileNum); //increment after
+    snprintf(out, 63, "%s/SAMPLE%02lu/%08u.dat", SD_MOUNT, sample_num, fileNum); //increment after
     struct stat st;
     if (stat(out, &st) == 0) {
         // file already exists! return error, as we do not want to overwrite data.
@@ -321,7 +341,24 @@ static esp_err_t get_file_path(char * out, /*uint16_t ch_num,*/ uint16_t fileNum
  * @returns Returns either ESP_OK or ESP_FAILS if file fails to open
  */
 static esp_err_t append_log_file(char *file_path, char* data) {
-    FILE *f = fopen(file_path, "a");  // append mode (to end of file). Will create a file if needed
+    FILE *f = fopen(file_path, "ab");  // append mode (to end of file). Will create a file if needed
+    if (f == NULL) {
+        return ESP_FAIL;
+    }
+    // append data to file
+    fprintf(f, "%s\n", data);
+    fclose(f);  // close file to save
+    return ESP_OK;
+}
+/**
+ * Function to create a new text file (.txt) for logging information, or storing metadata. 
+ * Overwrites file if one already exists
+ * @param file_path: Path of the logging file, or file to store data
+ * @param data: data to write to the given file
+ * @returns Returns either ESP_OK or ESP_FAILS if file fails to open
+ */
+static esp_err_t write_log_file(char *file_path, char* data) {
+    FILE *f = fopen(file_path, "wb");  // write mode (to overwrite existing logs). Will create a file if needed
     if (f == NULL) {
         return ESP_FAIL;
     }
@@ -332,7 +369,7 @@ static esp_err_t append_log_file(char *file_path, char* data) {
 }
 /**
  * Function that reads the next line from an already opened file. Reads character by character until LF encountered
- * @param fp: FILE pointer to a file opened with reading permission, non-binary.
+ * @param fp: FILE pointer to a file opened with reading permission, and binary data.
  * @param out: pointer to the string output
  * @param max_length: max length of string output
  * @return  
@@ -340,22 +377,24 @@ static esp_err_t append_log_file(char *file_path, char* data) {
  *  ESP_TIMEOUT if max_length reached (still ok),
  *  ESP_ERR_INVALID_STATE if end-of-file (EOF) is reached.
  */
-static esp_err_t read_line_file(FILE* fp, char* out, size_t max_length) {
+static esp_err_t read_line_file(FILE* fp, char * out, size_t max_length) {
     //size_t num_read = 0;
     size_t i = 0;
     // while( (*(out+i) = fgetc(fp)) != '\n' && i++ < max_length -1) i++;    // one liner!
+    // *cough* strchr(string, '\n') will return pointer/position of first occurance of '\n'...
     for (i = 0; i < max_length -1; i++) {
         int ch = fgetc(fp);
+        // printf("in 'read_line_file': ch: %c, 0x%X\n", ch, ch);
         if (ch == '\n') {
             // stop b/c of newline. b/c using a file, file cursor keeps position.
             break;
         }   // could combine into one if statement, but if need to distinguish for debug...
-        if (ch == 0)    // null char
+        else if (ch == 0)    // null char
             break;
-        if (ch == EOF)  //EOF is -1
+        else if (ch == EOF)  //EOF is -1
             break;
-        // if current character is none of these, assign it to our string
-        *(out+i) = ch;
+        else // if current character is none of these, assign it to our string
+            *(out+i) = ch;
     }
     *(out+i) = 0;   // null-termination. overwrites the newline.
 
@@ -460,6 +499,69 @@ static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc
     *out_handle = handle;
 }
 
+// Run this first to configure the SD slot parameters
+void init_sd_config(sdmmc_host_t *out_host, sdmmc_slot_config_t *out_slot_config, int freq_khz) {
+    // By default, SD card frequency is initialized to SDMMC_FREQ_DEFAULT (20MHz)
+    // For setting a specific frequency, use host.max_freq_khz
+    // (range 400kHz - 40MHz for SDMMC, 400kHz - 20MHz for SDSPI)
+    // Example: for fixed frequency of 10MHz, use host.max_freq_khz = 10000;
+    ESP_LOGI(SD_TAG, "Using SDMMC peripheral");
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.max_freq_khz = freq_khz;
+
+    // This initializes the slot without card detect (CD) and write protect (WP) signals.
+    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    // TODO: add card detect (CD)
+    
+    // Set bus width to use:
+    slot_config.width = 4;
+
+    // Enable internal pullups on enabled pins. The internal pullups
+    // are insufficient however, please make sure 10k external pullups are
+    // connected on the bus. This is for debug / example purpose only.
+    // slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+    *out_host = host;
+    *out_slot_config = slot_config;
+}
+// use this to init the SD card for raw access
+esp_err_t init_sd_card(sdmmc_card_t **out_card) {
+    esp_err_t ret = ESP_OK;
+    sdmmc_card_t* card = (sdmmc_card_t *)malloc(sizeof(sdmmc_card_t));
+    if (card == NULL) {
+        ESP_LOGE(SD_TAG, "Failed to allocate sdmmc_card_t structure");
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+
+    // Initialize the interface
+    ret = sdmmc_host_init();
+    ESP_ERROR_CHECK(ret);
+    ret = sdmmc_host_init_slot(SDMMC_HOST_SLOT_1, &slot_config_g);
+    ESP_ERROR_CHECK(ret);
+
+    ret = sdmmc_card_init(&host_g, card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(SD_TAG, "Failed to initialize SD card (%s)", esp_err_to_name(ret));
+        ESP_LOGE(SD_TAG, "If you were using SDMMC and switched to SPI reinsert the SD card or power cycle the board");
+        free(card);
+        ESP_ERROR_CHECK(ret);
+    }
+    ESP_LOGI(SD_TAG, "SD card mounted - raw access");
+    sdmmc_card_print_info(stdout, card);
+
+    *out_card = card;
+
+    return ret;
+}
+// Denitializes the card, and SDMMC peripheral
+void deinit_sd_card(sdmmc_card_t **card) {
+    // Unmount SD card
+    sdmmc_host_deinit();
+
+    free(*card);
+    *card = NULL;
+}
 // ----- ISRs -----
 static void IRAM_ATTR start_isr_handler(void* arg) {
     // give notice to adc task, which initializes the adc module with sample frequency, and runs until all data read.
@@ -564,9 +666,13 @@ static bool IRAM_ATTR on_timer_alarm(gptimer_handle_t handle, const gptimer_alar
 // Task to initialize adc with desired parameters, run the adc, delegate printing to other task, and when done, release resources.
 static void adc_task(void* args) {
     // maybe useful to pin this task to opposite core that printing task will be on.
+    esp_err_t err; 
     ESP_LOGI(ADC_TASK_TAG, "ADC Task Created");
     my_handlers_t *myHandles = (my_handlers_t*) args;
     adc_continuous_handle_t *adc_handle = myHandles->adc_handle;
+
+    char log_file[128] = {0};   // buffer to store file path for log
+    char temp_data[256] = {0};  // buffer to store data to write to log file
 
     while(1) {
         ESP_LOGI(ADC_TASK_TAG, "ADC Task Waiting");
@@ -578,9 +684,10 @@ static void adc_task(void* args) {
             continue;   // will go wait again
         }
         // also check SD card detect pin
+    #if USE_SD_CARD
         // check if sample folder exists, if not, create it
         char tmpBuf[64] = {0};
-        snprintf(tmpBuf, 64, "%s/SAMPLE%02u/", SD_MOUNT, sample_num);
+        snprintf(tmpBuf, 64, "%s/SAMPLE%02lu/", SD_MOUNT, sample_num);
         // created function to check existence of folder, and create it, if desired.
         if (check_dir(tmpBuf, true) != ESP_OK) {
             // only occurs if 'make_dir' is false.  
@@ -588,24 +695,55 @@ static void adc_task(void* args) {
             continue;
         }
         // overwrite/clear past log files
-        snprintf(tmpBuf, 64, "%s%s/samp%03u.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
+        snprintf(tmpBuf, 64, "%s%s/samp%03lu.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
         if (check_dir(tmpBuf, false) == ESP_OK) {
             // file exists, remove it (FUTURE: rename it? ie, append '.old' to file?)
             unlink(tmpBuf); // unlink == remove
             ESP_LOGW(ADC_TASK_TAG, "Removed previous log file (%s)", tmpBuf);
         }
+    #elif USE_RAW_SD
+        // Get sample_num and sample_start_sector from NVS
+        err = get_nvs_uint(SAMPLE_NUM_NVS, &sample_num);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            // set sample num
+            ESP_LOGW(ADC_TASK_TAG, "Setting sample_num to 0");  //warning or debug level?
+            sample_num = 0;
+        } else if (err != ESP_OK) {
+            // some other error occured, break out?
+            ESP_LOGE(ADC_TASK_TAG, "NVS get error, aborting ADC conversion");
+            continue;
+        }
+        err = get_nvs_uint(SAMPLE_START_NVS, &sample_start_sector);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(ADC_TASK_TAG, "Setting sample_starting_sector to default");
+            sample_start_sector = DEFAULT_STARTING_SECTOR;
+        } else if (err != ESP_OK) {
+            ESP_LOGE(ADC_TASK_TAG, "NVS get error, aborting ADC conversion");
+            // realistically, we can just set it to default, but I guess it's to avoid data overwritting
+            continue;
+        }
+        sample_sector = sample_start_sector;    // get the sector ready for the ADC_COPY_TASK
+        // Now these vars are ready for the next task
+    #endif
 
         ESP_LOGI(ADC_TASK_TAG, "Beginning ADC setup...");
         ESP_LOGI(ADC_TASK_TAG, "Suspending monitor task (logging)");
-        vTaskSuspend(monitor_handle);
+        // vTaskSuspend(monitor_handle);    // monitor also handles rotary encoder updates, so suspending it freezes hardware as well.
         // suspend other tasks as necessary, or suppress logging somehow
+        esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_WARN); // the TAG will only print/log ERROR level logs
 
         // start by getting some variables designed.
         *adc_handle = NULL; // set handle to NULL. 
         // run init function, global frequency variable will set adc frequency.
         continuous_adc_init(channel, sizeof(channel) / sizeof(adc_channel_t), adc_handle);  //adc_handle is pointer itself
-        ESP_LOGI(ADC_TASK_TAG, "Handle initialized. (waits 2 seconds)");
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        if (adc_handle == NULL) {
+            ESP_LOGE(ADC_TASK_TAG, "Error initializing ADC, handle NULL");
+            unsuppress_logs(SUPPRESS_LEVEL);    // to restore monitor task (lazily)
+            continue;
+        }
+        
+        ESP_LOGI(ADC_TASK_TAG, "Handle initialized. (waits 2.5 seconds)");
+        vTaskDelay(2500 / portTICK_PERIOD_MS);
 
         bytes_read = 0; //reset bytes read to zero.
         adc_continuous_evt_cbs_t cbs = {
@@ -641,16 +779,56 @@ static void adc_task(void* args) {
         ESP_ERROR_CHECK(adc_continuous_stop(*adc_handle));
         adc_state = false;  //update state var. 
         gpio_set_level(RED_LED, adc_state); // turn LED off. could just hard code 0. 
-        #if !USE_SD_CARD
+        #if !USE_SD_CARD && !USE_RAW_SD
         // inform python that this sampling period has ended
         printf("%s\n", PY_END_TAG);
         #endif
-        // FUTURE: stop waveplate
-        // send "st" to stop waveplate rotation. Is there a reason to reverse ("bw") back to home? 
 
         ESP_ERROR_CHECK(adc_continuous_deinit(*adc_handle));
         ESP_LOGI(ADC_TASK_TAG, "ADC deinitialized.");
         *adc_handle = NULL; //reset back to null
+        // FUTURE: stop waveplate
+        // send "st" to stop waveplate rotation. Is there a reason to reverse ("bw") back to home? 
+
+    #if USE_RAW_SD
+        // save sample_start_sector in a file with sample num. requires total number of sectors written
+        uint32_t num_sectors = sample_sector - sample_start_sector;
+        snprintf(log_file, 128, "%s/samp%03lu.txt", base_path, sample_num);
+        snprintf(temp_data, 256, "sample_num: %lu\nstart_sector: %lu\nnum_sectors: %lu\nsample_freq: %lu\nsample_duration: %lu\n",
+                sample_num, sample_start_sector, num_sectors, /* end - start = total sectors written */
+                sample_frequency, sample_duration);     // now includes the frequency and duration. Important metadata!
+        
+        ESP_LOGD(ADC_TASK_TAG, "log_file: %s\ntemp_data:\n%s", log_file, temp_data);     // log debug information
+        if (num_sectors*512 != bytes_read) {
+            ESP_LOGW(ADC_TASK_TAG, "Failed sanity check: sectors = %lu, sectors*512 = %lu vs. bytes read = %lu",
+                         num_sectors, num_sectors*512, bytes_read);
+            unsuppress_logs(SUPPRESS_LEVEL);
+            continue;
+        }
+        err = write_log_file(log_file, temp_data);   // log/write the information to the file. (overwrite if necessary)
+        if (err == ESP_FAIL) {
+            ESP_LOGE(ADC_TASK_TAG, "Failed to open and write to log file (%s). Sample sector address not saved!", log_file);
+            unsuppress_logs(SUPPRESS_LEVEL);
+            continue;
+        }
+
+        // else it was successful
+        ESP_LOGI(ADC_TASK_TAG, "Sample #%lu address saved to flash successfully", sample_num);
+        // update sample_start_sector for next time
+        sample_start_sector = sample_sector + 512*2;    // give a little buffer between 
+        sample_sector = sample_start_sector;
+        // store sample_start_sector into NVS
+        nvs_set_u32(my_nvs_handle, SAMPLE_START_NVS, sample_start_sector);
+        sample_num++; 
+        nvs_set_u32(my_nvs_handle, SAMPLE_NUM_NVS, sample_num); // store sample_num into NVS for next sample run.
+        nvs_commit(my_nvs_handle);  // commit the changes
+        ESP_LOGD(ADC_TASK_TAG, "Sample variables saved to NVS successfully");
+    #endif
+
+        xTaskNotifyGive(adc_transfer_handle);
+        // wait to complete
+        vTaskSuspend(NULL); // waits to be resumed by adc_transfer_handle
+        // ESP_LOGW(ADC_TASK_TAG, "Skipping file output to console until Python Serial monitor is ready.");
 
     #if USE_SD_CARD
         // notify ADC transfer task
@@ -661,10 +839,15 @@ static void adc_task(void* args) {
         ESP_LOGW(ADC_TASK_TAG, "Skipping file output to console. Get data off of SD card instead.");
         // Update sample_num after data has been transfered to PC
         sample_num++; 
+        // nvs_set_u32(my_nvs_handle, SAMPLE_NUM_NVS, sample_num);
+        // nvs_commit(my_nvs_handle);  // commit the change
     #endif
 
-        ESP_LOGI(ADC_TASK_TAG, "Resuming monitor task (logging)");
-        vTaskResume(monitor_handle);
+        // restore logs if not suppressed.
+        if (!logs_suppressed) {
+            ESP_LOGI(ADC_TASK_TAG, "Resuming monitor logging");
+            esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);
+        }
     }
 }
 // Task to handle adc conversion result, whether it prints to python, or saves to SD card.
@@ -674,10 +857,11 @@ static void adc_copy_task(void* args) {
     adc_continuous_handle_t *adc_handle = handles->adc_handle;  //it is a pointer, de-reference as needed.
     // will also need the handle for the SD card (or have it global)
     // uint32_t byte_count = 0; //moved to global => bytes_read
-
+    sdmmc_card_t * card = handles->card;
     esp_err_t ret;
     uint32_t ret_num = 0;
     memset(adc_conv_buffer, 0xcc, ADC_BUFFER_LEN);   // clear the result buffer
+    // uint32_t write_sector = 0;   // function superceded by global 'sample_sector'
 
     ESP_LOGI(ADC_COPY_TAG, "adc_copy_task created and initialized");
     for(;;) {
@@ -693,12 +877,20 @@ static void adc_copy_task(void* args) {
         char temp_data[128] = { 0 };
 
         ESP_LOGD(ADC_COPY_TAG, "Free Heap size: %"PRIu32" B; Min. Free Heap: %"PRIu32" B", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
-        // char unit[] = EXAMPLE_ADC_UNIT_STR(EXAMPLE_ADC_UNIT);   //not used (except in an else)
+        // write_sector = sample_start_sector; // use write_sector so that sample_start_sector is saved properly in ADC_TASK
         while (1) {
             ret = adc_continuous_read(*adc_handle, adc_conv_buffer, ADC_BUFFER_LEN, &ret_num, 1);
             if (ret == ESP_OK) {
                 ESP_LOGI(ADC_COPY_TAG, "return val is %x, ret_num is %"PRIu32" bytes", ret, ret_num);
-                #if USE_SD_CARD
+                
+            #if USE_RAW_SD
+                // use sample_start_sector to write adc_conv_buffer to SD card via raw access
+                size_t num_sectors = ret_num / 512; // sector size is 512 B. 
+                sdmmc_write_sectors(card, adc_conv_buffer, sample_sector, num_sectors);
+                sample_sector += num_sectors; //update sector start for next buffer
+                // transfer is complete,                 
+                
+            #elif USE_SD_CARD
                 // Get a file path to write results to, write to it, then close file.
                 while (get_file_path(file_path, file_num) != ESP_OK) {
                     ESP_LOGE(ADC_COPY_TAG, "Error getting file path (%s). File Exists!", file_path);
@@ -730,7 +922,7 @@ static void adc_copy_task(void* args) {
                     break;
                 };
                 // log file updated
-                #else   // USE_SD_CARD == FALSE, so print to console
+            #else   // USE_SD_CARD == FALSE, so print to console
                 printf("%s\n", PY_TAG);   // display tag for python.
                 printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read
                 // adc_task will suspend any tasks that log. 
@@ -752,7 +944,7 @@ static void adc_copy_task(void* args) {
                         ESP_LOGW(ADC_COPY_TAG, "Invalid data [%s_%"PRIu32"_%"PRIx32"]", unit, chan_num, data);
                     }
                 }
-                #endif // end USE_SD_CARD
+            #endif // end USE_SD_CARD
                 // in either case, tally the number of bytes read so far. 
                 bytes_read += ret_num;
                 // check if we read enough bytes.
@@ -761,6 +953,7 @@ static void adc_copy_task(void* args) {
                     // resume ADC task to stop ADC and clean up
                     ESP_LOGI(ADC_COPY_TAG, "total bytes read: %"PRIu32"", bytes_read);
                     ESP_LOGI(ADC_COPY_TAG, "minimum sample bytes to read: %"PRIu32"", bytes_to_read);
+                    // store sample_start_sector in file and NVS, or do in ADC_TASK?
                     vTaskResume(adc_task_handle);
                     vTaskDelay(1500/portTICK_PERIOD_MS); //give adc_task some time before breaking and waiting above
                     break;  // exit the inner while loop to wait for notify by adc_conv_done_cb
@@ -785,20 +978,118 @@ static void adc_copy_task(void* args) {
 // Task to transfer adc data from file to PC
 static void adc_transfer_task(void* args) {
     esp_err_t ret;
+#if USE_SD_CARD
     uint8_t result[ADC_BUFFER_LEN]; // holder for results array read from file. -- may be able to reuse adc_conv_buffer to save on heap memory!
-    char strBuf[128] = { 0 };   // buffer to hold data that is read in from the data file
+    char strBuf[256] = { 0 };   // buffer to hold data that is read in from the data file
     char data_file[64] = { 0 }; // buffer to hold the data file to be openned.
     uint32_t ret_num = 0;   // number bytes from file
+#elif USE_RAW_SD
+    my_handlers_t * handles = (my_handlers_t*) args;
+    sdmmc_card_t * card = handles->card;
+    char data_buf[256] = {0};   // buffer to store the contents of the log file
+    char log_file[64] = {0};    // buffer to hold log file
+    uint32_t num_sectors = 0;  // number of sectors
+    uint32_t ret_num = ADC_BUFFER_LEN;   // if a variable amount of bytes to read and send is required at some point, here's the variable
+#endif
 
     ESP_LOGI(ADC_TRANS_TAG, "adc_transfer_task initialized and beginning...");
     while(1) {
         ESP_LOGI(ADC_TRANS_TAG, "Task waiting for notification from adc_task");
         // Wait for notification to transfer data from SD card file to PC (via UART)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // start by getting and opening the file from flash.
+        snprintf(log_file, 128, "%s/samp%03lu.txt", base_path, sample_num - 1); // sample_num was incremented before this loop, go back one
+        ESP_LOGD(ADC_TRANS_TAG, "Openning log file '%s'", log_file);
+        FILE* log_fp = fopen(log_file, "rb");    // open for reading (binary). File written with just write mode and binary.
+        if (log_fp == NULL) {
+            ESP_LOGE(ADC_TRANS_TAG, "Error openning log file (%s)", log_file);
+            ESP_LOGE(ADC_TRANS_TAG, "NOTE: Sample results not exported!");
+            // free(result_buf);   // don't forget to free it every time!
+            vTaskResume(adc_task_handle);   // don't forget to do this!
+            continue;
+        }   // else the file was openned successfully!
+        // Data written: "sample_num:%lu\nstart_sector:%lu\nnum_sectors:%lu\nsample_freq:%lu\nsample_duration:%lu\n"
+        ret = read_line_file(log_fp, data_buf, 256);
+        // check ret val?
+        ESP_LOGD(ADC_TRANS_TAG, "1st line read from log file: '%s'", data_buf);
+        uint32_t d_num, d_start, s_freq, s_dur; // vars to read data into. 
+        sscanf(data_buf, "%*s %lu", &d_num);  // %*s will read a string and discard. the ':' will be read and compared, if matches, continues.
+        
+        if (d_num != sample_num -1) /* Sanity check */ {
+            ESP_LOGE(ADC_TRANS_TAG, "Housten, we have a problem! (expected sample number (global-1: %lu) != sample_number from file (%lu)",
+                 sample_num -1, d_num);
+            // free(result_buf);
+            fclose(log_fp);
+            vTaskResume(adc_task_handle);
+            continue;
+        }
+        ret = read_line_file(log_fp, data_buf, 256);
+        sscanf(data_buf, "%*s %lu", &d_start);    // gets starting sector address
+        
+        ret = read_line_file(log_fp, data_buf, 256);
+        sscanf(data_buf, "%*s %lu", &num_sectors);  // gets number of sectors to read
+
+        ret = read_line_file(log_fp, data_buf, 256);
+        sscanf(data_buf, "%*s %lu", &s_freq);       // sample frequency
+
+        ret = read_line_file(log_fp, data_buf, 256);
+        sscanf(data_buf, "%*s %lu", &s_dur);        //sample duration
+        fclose(log_fp); // not super critical for reading only, but good practice.
+
+        ESP_LOGD(ADC_TRANS_TAG, "Metadata from file: Sample #%lu, start: %lu, size: %lu, freq: %lu, dur: %lu", 
+                                                            d_num, d_start, num_sectors, s_freq, s_dur);// log debug information
+        // add some error checking?
+        // Now that we have the information from the file, we can call sdmmc_read_sector() to read the data in, but only read ADC_BUFFER_LEN at a time
+        vTaskDelay(10000/portTICK_PERIOD_MS);    // debug delay (to read logs above)
+        // send metadata to python here instead of in adc_task?
+        uint8_t * result_buf = (uint8_t*) calloc(sizeof(uint8_t), ADC_BUFFER_LEN);  // malloc to get memory, and then free it after usage.
+        if (result_buf == NULL) {
+            ESP_LOGE(ADC_TRANS_TAG, "Not enough memory for result_buf !");
+            ESP_LOGI(ADC_TRANS_TAG, "Free heap mem: %"PRIu32"", esp_get_free_heap_size());
+            vTaskResume(adc_task_handle);
+            free(result_buf);
+            continue;
+        }
+
+        size_t step_sectors = ADC_BUFFER_LEN / 512, transferred = 0;    // step_sectors = number of sectors per 16 kB buffer (ADC_BUF_LEN)
+        ret_num = ADC_BUFFER_LEN;
+        // loop from starting sector to the last sector by tracking the number of sectors transferred thus far.
+        for (; transferred < num_sectors; d_start += step_sectors, transferred += step_sectors) {
+            ret = sdmmc_read_sectors(card, result_buf, d_start, step_sectors);  // make a macro for sector size? 
+            if (ret != ESP_OK) {
+                ESP_LOGE(ADC_TRANS_TAG, "Error reading SD card sectors for addr: %lu, and size: %u", d_start, step_sectors);
+                free(result_buf);
+                break;
+            }
+            // use printf, or write to uart directly (as binary)? Will there ever be a time when there is less actual data in a sector?
+            // use printf, because we want to extract the data properly from the result_buf
+            printf("%s\n", PY_TAG);   // display tag for Python.
+            printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read (bytes)
+            // Loop runs 8196 times (so 8196 lines to read in)
+            for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
+                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result_buf[i];
+                uint32_t chan_num = EXAMPLE_ADC_GET_CHANNEL(p); //uint32_t is much bigger than necessary
+                uint32_t data = EXAMPLE_ADC_GET_DATA(p);
+                /* Check the channel number validation, the data is invalid if the channel num exceed the maximum channel */
+                if (chan_num < SOC_ADC_CHANNEL_NUM(EXAMPLE_ADC_UNIT)) {
+                    // printf("ch: %"PRIu32"; value: %"PRIx32"\n", chan_num, data); 
+                    // print as few characters as possible for speed, although not as important with this implementation
+                    printf("%"PRIu32", %"PRIx32"\n", chan_num, data);
+                    // fwrite();    // write a buffer of data to stdout stream. 
+                } else {
+                    ESP_LOGW(ADC_TRANS_TAG, "Invalid data (ch_data) [%"PRIu32"_%"PRIx32"]", chan_num, data);
+                }
+            }
+            // update to start address and total transferred done in for loop. 
+            vTaskDelay(1/portTICK_PERIOD_MS);   // give Python a minute amount of time to process (increase if needed).
+        }   // end reading sample from SD card
+
+    #if USE_SD_CARD
         // snprintf(data_file, 64, "%s/%s/samp%03u.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
         // snprintf(temp_data, 64, "File: %s\nBytes Written: %"PRIu32"\n", file_path, ret_num);
         // Read in the files that we need to transfer to PC from the sample log file
-        snprintf(data_file, 64, "%s%s/samp%03u.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
+        snprintf(data_file, 64, "%s%s/samp%03lu.txt", SD_MOUNT, SAMPLE_LOG_DIR, sample_num);
         FILE * f = fopen(data_file, "r");
         if (f == NULL) {
             ESP_LOGE(ADC_TRANS_TAG, "Error openning log file: %s", data_file);
@@ -886,8 +1177,11 @@ static void adc_transfer_task(void* args) {
         }   // while for # of buffer files
         fclose(f);  // close the file to release resources
         // inform python that this sampling period has ended
+    #endif
+        // finish transfer by sending tag and resuming the adc_task. Also free buffer
         printf("%s\n", PY_END_TAG);
         vTaskResume(adc_task_handle);   // resume the adc_task that is waiting for this to finish 
+        free(result_buf);   // free the memory from buffer
     }
 }
 // Task to periodically display debug or info messages on variable states, etc. Also updates vars from PCNT events.
@@ -925,10 +1219,11 @@ static void monitor_var_task(void* args) {
             
             // debug level logs
             // ESP_LOGD(MONITOR_TASK_TAG, "adc_state: %d", adc_state);  // visually shown with LED
-            ESP_LOGD(MONITOR_TASK_TAG, "servo state: %d", pupil_path_state);
+            ESP_LOGD(MONITOR_TASK_TAG, "servo state: %d", pupil_path_state);    // not shown with LED
             ESP_LOGD(MONITOR_TASK_TAG, "bytes_read: %"PRIu32"", bytes_read);
-            ESP_LOGD(MONITOR_TASK_TAG, "menuIndex: %d", menuIndex);     // visually shown on LCD, but good as debug. 
-            ESP_LOGD(MONITOR_TASK_TAG, "base_pos: %"PRIu16"", base_pos);    
+            ESP_LOGD(MONITOR_TASK_TAG, "Free heap memory: %"PRIu32"", esp_get_free_heap_size());
+            // ESP_LOGD(MONITOR_TASK_TAG, "menuIndex: %d", menuIndex);     // visually shown on LCD, but good as debug. 
+            // ESP_LOGD(MONITOR_TASK_TAG, "base_pos: %"PRIu16"", base_pos);    
         }
     }
 }
@@ -972,25 +1267,28 @@ static void uart_event_task(void *pvParameters) {
             switch (event.type) {                  // Check the type of UART event
                 case UART_DATA:                    // If data is received
                     // Read the incoming data into the buffer
-                    esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_WARN);  // reduce log statements
+                    esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_NONE);  // reduce log statements
                     uart_read_bytes(PC_UART_NUM, dtmp, event.size, portMAX_DELAY);  // only ever reads 1 byte at once (even CRLF is split!)
                     dtmp[event.size] = '\0';       // Null-terminate the string
-                    printf("Received %u bytes: %s (%X)\n", event.size, (char*) dtmp, dtmp[0]);  // Print received data
+                    // printf("Received %u bytes: %s (%X)\n", event.size, (char*) dtmp, dtmp[0]);  // Print received data
                     // build up a buffer until a newline character. (if event.size is 1)
                     // actually recieves CRLF (\r\n)
                     if (dtmp[0] == '\r') {
+                        printf("\n");    // put a newline as printf below doesn't.
+                        // esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);     // restore log level before handling command.
                         // process command
                         handle_command(tmpStr, pvParameters);   // handle the command
                         memset(tmpStr, 0, UART_READ_BUF);   // clear the tmpStr
                         pStr = tmpStr;
-                        esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);     // restore log level
+                        if (!logs_suppressed)    // restore log level only when not suppressed
+                            esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);     // restore log level (does so after suppress command! lol)
                         break;
                     }
                     // else add dtmp to tmpStr
                     // strcat(tmpStr, (char*) dtmp);
                     *pStr = dtmp[0];
                     pStr += 1;  // move pointer address up by 1 (to next position in string)
-                    printf("tmpStr: %s\n", tmpStr);
+                    printf("tmpStr: %s\n", tmpStr); // TODO: make more professional? (use \r to overwrite previous tmpStr?)
                     // handle_command((char*) dtmp, pvParameters);  // Pass received data to command handler
                     break;
                 case UART_PATTERN_DET:
@@ -999,7 +1297,7 @@ static void uart_event_task(void *pvParameters) {
                     size_t len = 0;
                     uart_get_buffered_data_len(PC_UART_NUM, &len);
                     uart_read_bytes(PC_UART_NUM, dtmp, len, 0);
-                    dtmp[len] = 0;  // give string its null-termination
+                    dtmp[len-1] = 0;  // give string its null-termination (removing the newline)
                     handle_command(dtmp, pvParameters);
                     break;
             #pragma region 
@@ -1066,9 +1364,25 @@ static void handle_command(const char* command, void* args) {
         // notify servo task
         xTaskNotifyGive(servo_task_handle);
     } else if (strcmp(command, "reset samples") == 0) {
-        ESP_LOGI(UART_MON_TAG, "Resetting sample sector memory address (old sample data will be overwritten)");
-        // TODO: nvs_set_i32("sample_start", STARTING_SECTOR);
+        ESP_LOGI(UART_MON_TAG, "Resetting sample sector memory address (old sample data will be overwritten!)");
+        nvs_set_u32(my_nvs_handle, SAMPLE_START_NVS, DEFAULT_STARTING_SECTOR);
+        nvs_set_u32(my_nvs_handle, SAMPLE_NUM_NVS, 0);
+        nvs_commit(my_nvs_handle);
+        // also remove flash log files? technically those are still valid (until the data is overwritten)
+        // TODO: unmount, reformat, and remount flash.
+        // esp_vfs_fat_spiflash_unmount_rw_wl
+        ESP_LOGI(UART_MON_TAG, "Reformatting SPI flash storage...");
+        esp_vfs_fat_spiflash_format_rw_wl(base_path, "storage");
+        ESP_LOGI(UART_MON_TAG, "... formatting finished. Flash mounted.");
         
+    } else if(strcmp(command, "suppress") == 0) {
+        ESP_LOGI(UART_MON_TAG, "Supressing all logs to WARN level, and some to INFO.");
+        suppress_logs(SUPPRESS_LEVEL);
+
+    } else if (strcmp(command, "unsuppress") == 0) {
+        ESP_LOGI(UART_MON_TAG, "Unsuppressing all logs to DEBUG level");
+        unsuppress_logs(ESP_LOG_DEBUG); // TODO: in final implementation, info level should do.
+
     } else {    // If the command is more advanced, or unknown
         // split string on space, see if left is "set", "setf", or "setd"
         char* token = strtok(command, " "); // tokenize based on space
@@ -1076,7 +1390,7 @@ static void handle_command(const char* command, void* args) {
 /*set*/ if (token != NULL && strcmp(token, "set") == 0) {
             token = strtok(NULL, " ");
             if (token == NULL) {
-                ESP_LOGW(UART_MON_TAG, "Invalid argument for \"set\" command. Usage: \"set <freq [kHz]> <dur [ms]>\"");
+                ESP_LOGW(UART_MON_TAG, "Invalid argument for \"set\" command. Usage: \"set <freq [Hz]> <dur [ms]>\"");
                 return;
             }   // else not NULL
             int ret = sscanf(token, "%"PRIu32"", &sample_frequency);
@@ -1133,6 +1447,7 @@ static void handle_command(const char* command, void* args) {
     }
 }
 
+// 'inline' = hint to compiler to replace function call with the code inside the function (an optimization)
 static inline uint32_t example_angle_to_compare(int angle)  {
     return (angle - SERVO_MIN_DEGREE) * (SERVO_MAX_PULSEWIDTH_US - SERVO_MIN_PULSEWIDTH_US) / (SERVO_MAX_DEGREE - SERVO_MIN_DEGREE) + SERVO_MIN_PULSEWIDTH_US;
 }
@@ -1152,13 +1467,74 @@ static inline uint32_t example_angle_to_compare(int angle)  {
 //     return ESP_OK;
 // }
 
+// Simple function to read a line from a file. 
+static esp_err_t simple_file_read(char *path) {
+    ESP_LOGI(FLASH_TAG, "Reading file (%s)", path);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        ESP_LOGE(FLASH_TAG, "Failed to open file for reading");
+        return ESP_FAIL;
+    }
+    char line[EX_FILE_LEN];
+    fgets(line, sizeof(line), f);
+    fclose(f);
+    // strip newline
+    char *pos = strchr(line, '\n');
+    if (pos) {
+        *pos = '\0';
+    }
+    ESP_LOGI(FLASH_TAG, "Read from file: '%s'", line);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Sets all log levels to WARNINGS or higher. 
+ *      Sets logs specific to this file to general_level, with some exceptions.
+ * @param general_level: specifies the highest log level of log TAGs in this file
+ */
+static void suppress_logs(esp_log_level_t general_level) {
+    ESP_LOGI(MAIN_TAG, "Suppressing logs to %d (0=Error, 5=Verbose)", general_level);
+    // suppresses log levels to Warning or lower/higher
+    esp_log_level_set("*", ESP_LOG_WARN);   // suppresses all monitor logs, and logs from other files
+    esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_WARN);  // explicitly suppress this one.
+    // make it so that select tasks have higher log levels
+    esp_log_level_set(ADC_TASK_TAG, general_level);   // really just needs info level
+    esp_log_level_set(ADC_COPY_TAG, general_level);
+    esp_log_level_set(ADC_TRANS_TAG, general_level);
+    esp_log_level_set(MAIN_TAG, general_level);     // in loop, main has no logs!
+    esp_log_level_set(UART_MON_TAG, ESP_LOG_INFO);  // should always be on info!
+    esp_log_level_set(SERVO_TASK_TAG, ESP_LOG_INFO);
+
+    logs_suppressed = true;
+}
+/**
+ * @brief Sets all log levels to global_level. 
+ *          Some logs are set to INFO, while one is set to DEBUG
+ * @param global_level: specifies the highest log level of all TAGs
+ */
+static void unsuppress_logs(esp_log_level_t global_level) {
+    esp_log_level_set("*", global_level);
+    esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);
+
+    // In case global is < Info (warn (2) or error(1)), these should always be on info
+    if (global_level < ESP_LOG_INFO) {
+        esp_log_level_set(UART_MON_TAG, ESP_LOG_INFO);
+        esp_log_level_set(SERVO_TASK_TAG, ESP_LOG_INFO);
+        esp_log_level_set(ADC_TRANS_TAG, ESP_LOG_INFO);
+        esp_log_level_set(ADC_COPY_TAG, ESP_LOG_INFO);
+        esp_log_level_set(ADC_TASK_TAG, ESP_LOG_INFO);
+    }
+    logs_suppressed = false;
+}
+
 void app_main(void) {
     esp_err_t ret;  // var to hold return values
     esp_err_t err;  // other var for the same thing
 
     main_task_handle = xTaskGetCurrentTaskHandle();     // get task handle for main
     // Set log level to allow display of debug-level logging
-    esp_log_level_set("*", ESP_LOG_VERBOSE);  // enables debug logs globally (for debugging SD card)
+    esp_log_level_set("*", ESP_LOG_DEBUG);  // enables debug logs globally (for debugging SD card)
     esp_log_level_set(MAIN_TAG, ESP_LOG_DEBUG);
     esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);
     esp_log_level_set("sdmmc_req", ESP_LOG_DEBUG);
@@ -1174,8 +1550,10 @@ void app_main(void) {
 
     gpio_config(&io_conf);
     // Change default settings for SD card detect.
-    // gpio_pullup_dis(SD_DETECT);     // disable the default pullup for SD_detect
-    // gpio_pulldown_en(SD_DETECT);    // active high, means it must be GND for off (pulldown). -- handled by breakout board
+    gpio_reset_pin(SD_DETECT);
+    gpio_pullup_dis(SD_DETECT);     // disable the default pullup for SD_detect
+    gpio_pulldown_en(SD_DETECT);    // active high, means it must be GND for off (pulldown). -- handled by breakout board?
+    gpio_set_direction(SD_DETECT, GPIO_MODE_INPUT);
     // -- gpio outputs
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -1188,6 +1566,7 @@ void app_main(void) {
     gpio_set_level(RED_LED, 0);
     gpio_set_level(GREEN_LED, 0);
     gpio_set_level(BLUE_LED, 0);
+    gpio_set_level(SD_LED, 0);
     
     ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT));    //enable ISRs to be added.
     // ----------
@@ -1406,6 +1785,15 @@ void app_main(void) {
     ESP_LOGI(MAIN_TAG, "Waiting to initialize SD card (2s). Ensure clock wire is secured.");
     vTaskDelay(2000/portTICK_PERIOD_MS);
 
+#if USE_RAW_SD
+    ESP_LOGI(MAIN_TAG, "Initializing SD card for raw access");
+    init_sd_config(&host_g, &slot_config_g, SD_FREQUENCY);
+    sdmmc_card_t *card;
+
+    ESP_LOGI(MAIN_TAG, "Mounting SD card - raw access");
+    ret = init_sd_card(&card);
+    ESP_ERROR_CHECK(ret);
+#else
     esp_vfs_fat_sdmmc_mount_config_t mount_conf = {
         .format_if_mount_failed = FORMAT_IF_MOUNT_FAILS,
         .max_files = 8,    // max # of open files
@@ -1442,6 +1830,7 @@ void app_main(void) {
     ESP_LOGI(MAIN_TAG, "Filesystem mounted!");
     sdmmc_card_print_info(stdout, card_handle); // prints info on the SD card connected
     // ESP_LOGW(MAIN_TAG, "SD card not yet implemented, filesystem NOT mounted!");
+#endif
     #pragma endregion
     // --- PC UART Monitor ---
     #pragma region
@@ -1471,7 +1860,7 @@ void app_main(void) {
     uart_flush_input(PC_UART_NUM);  // clear buffer to ensure no garbage in there
     #pragma endregion
     // Initialize NVS
-#pragma region 
+    #pragma region 
     ESP_LOGI(MAIN_TAG, "Initializing non-volatile storage (NVS)...");
     err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1513,7 +1902,41 @@ void app_main(void) {
         // Close
         // nvs_close(my_nvs_handle);
     }
+    #pragma endregion
+    // Set up FATFS for SPI Flash
+    #pragma region
+    ESP_LOGI(MAIN_TAG, "Mounting FAT filesystem");
+    // To mount device we need name of device partition, define base_path
+    // and allow format partition in case if it is new one and was not formatted before
+    const esp_vfs_fat_mount_config_t mount_config = {
+            .max_files = 4,
+            .format_if_mount_failed = true,
+            .allocation_unit_size = CONFIG_WL_SECTOR_SIZE,
+            // .use_one_fat = false,
+    };
+    err = esp_vfs_fat_spiflash_mount_rw_wl(base_path, "storage", &mount_config, &s_wl_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(MAIN_TAG, "Failed to mount FATFS on flash (%s)", esp_err_to_name(err));
+        return;
+    }
+    // write test file
+    char hello_data[EX_FILE_LEN] = { 0};
+    snprintf(hello_data, EX_FILE_LEN, "%s %s\n", "hello world, from ESP-IDF", esp_get_idf_version());
+    ESP_LOGI(MAIN_TAG, "Writing hello_data to /spiflash/hello.txt; hello_data = %s", hello_data);
+    err = write_log_file("/spiflash/hello.txt", hello_data);
+    if (err != ESP_OK) {
+        ESP_LOGE(MAIN_TAG, "Error writing test file");
+        return;
+    }
+    // read file back
+    //Open file for reading
+    err = simple_file_read("/spiflash/hello.txt");
+    if (err != ESP_OK) {
+        return;
+    }
 #pragma endregion
+    
+#if USE_SD_CARD
     // create log file folder, if it doesn't already exist
     char tmpBuf[64] = {0};
     sprintf(tmpBuf, "%s%s/", SD_MOUNT, SAMPLE_LOG_DIR);
@@ -1523,7 +1946,7 @@ void app_main(void) {
         mkdir(tmpBuf, ACCESSPERMS);
         ESP_LOGI(ADC_TASK_TAG, "Directory created for sample logs: %s", tmpBuf);
     } // else stat will have info on the folder.
-
+#endif
     adc_continuous_handle_t handle = NULL;  //needed in many places, hold it here for distribution.
 
     my_servos_t servo_handles = {
@@ -1534,6 +1957,7 @@ void app_main(void) {
         .adc_handle = &handle,
         .gptimer = &timer_handle,
         .servos = &servo_handles,
+        .card = card,   //card is already a pointer
     };
     ESP_LOGI(MAIN_TAG, "Installing GPIO ISRs, then creating tasks");
     // Install GPIO ISRs
@@ -1545,7 +1969,7 @@ void app_main(void) {
     xTaskCreatePinnedToCore(adc_task, "ADC-TASK", TASK_STACK_SIZE, (void*)&handles, ADC_TASK_PRIORITY, (void*)&adc_task_handle, 1);    
     // pin printing task to core 1, and limit number of tasks on that core (better to not be pinned. Pin other tasks instead). 
     xTaskCreatePinnedToCore(adc_copy_task, "ADC-COPY", TASK_STACK_SIZE, (void*)&handles, COPY_TASK_PRIORITY, (void*) &adc_copy_handle, tskNO_AFFINITY);
-    xTaskCreatePinnedToCore(adc_transfer_task, "ADC-TRANSFER", TASK_STACK_SIZE*5, (void*)NULL, ADC_TRANSFER_PRIORITY, &adc_transfer_handle, 1);
+    xTaskCreatePinnedToCore(adc_transfer_task, "ADC-TRANSFER", TASK_STACK_SIZE*4, (void*)&handles, ADC_TRANSFER_PRIORITY, &adc_transfer_handle, 1);
     // vTaskSuspend(adc_copy_task);
     // Task that updates the lcd periodically. Cannot be preempted by other tasks when setting LCD display. Will scroll if interrupted.
     // xTaskCreate(lcd_task, "LCD-TASK", TASK_STACK_SIZE, lcd_ctx, 2, &lcd_task_handle);   // perhaps scrolling effect is caused by getting kicked off of CPU. increased priority
@@ -1554,7 +1978,7 @@ void app_main(void) {
     // servo task creation
     xTaskCreatePinnedToCore(servo_task, "SERVO-TASK", KB_TO_BYTES(2), (void*)&servo_handles, SERVO_TASK_PRIORITY, &servo_task_handle, tskNO_AFFINITY);
     // UART listening task needs access to the ADC handle, as well as the servo comparators to be passed to other functions.
-    xTaskCreatePinnedToCore(uart_event_task, "UART-LISTEN", KB_TO_BYTES(2), (void*)&handles, UART_RX_TASK_PRIORITY, &uart_monitor_handle, 0);   // cannot be free to run on core 1.
+    xTaskCreatePinnedToCore(uart_event_task, "UART-LISTEN", KB_TO_BYTES(2) + 512, (void*)&handles, UART_RX_TASK_PRIORITY, &uart_monitor_handle, 0);   // cannot be free to run on core 1.
     
     // set angle of servos to 'off' state
     // servo_angle = SERVO_MIN_DEGREE;
@@ -1584,15 +2008,17 @@ void app_main(void) {
             lcd1602_string(lcd_ctx, strBuf);
         }
         // check if SD card is inserted or not, if not, display a message, else ... temporarily display one? 
-        // if (gpio_get_level(SD_DETECT) == 0) {
-        //     snprintf(strBuf, 22, " %-20s", "No SD Card Inserted!");
-        //     lcd1602_set_cursor(lcd_ctx, 0, 19);
-        //     lcd1602_string(lcd_ctx, strBuf);
-        // }  else {   //else clear that line!
-        //     snprintf(strBuf, 22, " %s", BLANK_LINE);
-        //     lcd1602_set_cursor(lcd_ctx, 0, 19);
-        //     lcd1602_string(lcd_ctx, strBuf);
-        // } 
+        if (gpio_get_level(SD_DETECT) == 0) {
+            snprintf(strBuf, 22, " %-20s", "No SD Card Inserted!");
+            gpio_set_level(SD_LED, 0);
+            lcd1602_set_cursor(lcd_ctx, 0, 19);
+            lcd1602_string(lcd_ctx, strBuf);
+        }  else {   //else clear that line!
+            gpio_set_level(SD_LED, 1);
+            snprintf(strBuf, 22, " %s", BLANK_LINE);
+            lcd1602_set_cursor(lcd_ctx, 0, 19);
+            lcd1602_string(lcd_ctx, strBuf);
+        } 
         // change menu based on menu index, and display the appropriate value
         if (menuIndex == 0) {           //frequency
             lcd1602_set_cursor(lcd_ctx, 0, 1);
@@ -1637,8 +2063,16 @@ void app_main(void) {
         vTaskDelay(250/portTICK_PERIOD_MS); // 250ms delay make smaller if want faster response to user input. 
     }
     // unmount the sd card
+#if USE_RAW_SD
+    deinit_sd_card(&card);
+    ESP_LOGI(MAIN_TAG, "SD card unmounted - raw access");
+    // Unmount FATFS
+    ESP_LOGI(MAIN_TAG, "Unmounting FAT filesystem from flash");
+    ESP_ERROR_CHECK( esp_vfs_fat_spiflash_unmount_rw_wl(base_path, s_wl_handle));
+#else
     esp_vfs_fat_sdcard_unmount(mount_point, card_handle);
     ESP_LOGI(MAIN_TAG, "Card unmounted");
+#endif
     lcd1602_deinit(lcd_ctx);
     ESP_LOGI(MAIN_TAG, "LCD deinitialized");
     nvs_close(my_nvs_handle);
