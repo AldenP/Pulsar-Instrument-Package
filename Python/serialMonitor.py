@@ -12,11 +12,12 @@ import sys
 import threading
 import queue
 
+
 # Configure the serial port
 serial_port :str = 'COM3'  # Change this to your serial port
 baud_rate :int = 921600      # This can be increased by updating menuconfig UART setup for esp32 chip - limited by CP2102 chip (to 1Mbps)
 # num_samples = 16*1024      # this should match the ADC_BUFFER_LEN from ESP32 code. Currently 8KB
-chunk_size: int = 16*1024    # How much data Python will read at once as a chunk.
+chunk_size: int = 8*1024 * 7    # How much data Python will read at once as a chunk. 8k lines from 16KB MCU buffer, each line 7 bytes
 
 # Tags/Flags to look for when receiving data from MCU
 BEGIN_TAG = b"BEGIN PY READ"    # 'b' is to interpret as binary
@@ -32,6 +33,7 @@ DEFAULT_DIR = "./adc_data/"
 
 # The serial object for communicating with MCU
 ser : serial.Serial = serial.Serial(serial_port, baud_rate, timeout=5)  # 5 second timeout on reads
+ser.set_buffer_size(80*1024, None)  # set a buffer size to read from
 
 # Parameters and debug variables
 sample_freq :int = 0
@@ -41,7 +43,7 @@ total_read :int = 0
 
 input_queue = queue.Queue()  # Queue to store user commands
 
-def read_adc_data() -> dict:
+def read_adc_data() -> dict[int, array]:
     global loopCompletions
     global total_read
     print("PY > Reading ADC Data\n")
@@ -55,12 +57,13 @@ def read_adc_data() -> dict:
         # ch: #; value: #(in hex)
         # (#),(0x#) // for speed, extra characters are eliminated
         #eventually some kind of time value will be included. Possibly the current clock cycle.
+        # tic = time.perf_counter()
         line :str = ser.readline()
         if line.strip() == b"PY END":
             print(f"Read end tag: {str(line, encoding='utf-8')}")
             return adc_raw
         lineS = line.split(b',')
-        print(str(line, "utf-8"), end="")   # has newline in it already!
+        # print(str(line, "utf-8"), end="")   # has newline in it already!
         # chNum = int(lineS[0].split(b':')[1].strip()) #assumes base 10
         try:
             chNum = int(lineS[0].strip(), base=10)
@@ -72,8 +75,11 @@ def read_adc_data() -> dict:
             val_mV = val_raw * VMAX / DMAX      # Convert raw value to voltage
             adc_raw[chNum].append(val_mV)  #append works with array.
             total_read += 2
+            
+            # toc = time.perf_counter()
+            # print(f"Time processing this line: {(toc-tic)*1000 : 3.3f} ms")
         except ValueError:
-            print("Error reading a value from serial data in")  
+            print("<read_adc_data> Error reading a value from serial data in")  
             print(f"This line of data: \"{str(line, encoding="utf-8")}\"")
             print(f"Value of loop iterator {i=} of {numBytes=}; {loopCompletions=}; {total_read=}")
             exit(-1)
@@ -95,9 +101,10 @@ def read_adc_chunk():
     numBytes = line.split(':')[1].strip()    #gets the last index (should be same as 1) and removes whitespace    
     print(f"PY > numBytes sent from ESP32: {numBytes}")
     # BUG: num bytes is for the data portion, but what's sent over the channel is more than just data (whitespace, and comma). Raw write and read?
+    # "[chNum],_[3 digit hex, leading 0's as necessary]\n" Or 7 bytes. 
     
-    # use numBytes as portion to read, or 16 KB, whichever is less. 
-    chunk = str(ser.read(min(chunk_size, int(numBytes))), 'utf-8')  # read returns a byte array, convert to utf-8 encoded string
+    # read the number of bytes that corresponds to a 16kB chunk of ADC data. 
+    chunk = str(ser.read(chunk_size), 'utf-8')  # read returns a byte array, convert to utf-8 encoded string
     # the problem is probably the newline characters. Determine how many bytes each line is to determine amount to read.  
     partitioned :list[str] = chunk.split("\n")   # don't know if serial will output \r with \n  (CRLF/Windows) or just \n (LF/Unix) [probably just LF/Unix]
     # read may cut a line off, and so the 1st split element might need to be removed/sacrificed.   
@@ -182,7 +189,7 @@ while True:
 
     dataIn = ser.readline()    #timeout set by serial object   
     if dataIn == b'':
-        print(f'Py > Timed Out with no new data ({timeoutCount})')  #print to console if timed out
+        print(f'PY > Timed Out with no new data ({timeoutCount})')  #print to console if timed out
         timeoutCount +=1
 
     elif dataIn.strip() == META_TAG:
@@ -192,11 +199,11 @@ while True:
         line = dataIn.strip().split(b';')
         sample_freq = int(line[0].split(b':')[1], base=10) # Hz 
         sample_dur = int(line[1].split(b':')[1], base=10)  # ms  
-        print(f'Py > {sample_freq=}; {sample_dur=}')
+        print(f'Py > Recieved: {sample_freq=}; {sample_dur=}')
 
     elif dataIn.strip() == BEGIN_TAG:   #if input is the data we want, read it in.
         # adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values   
-        adc_data_partial = read_adc_chunk()
+        adc_data_partial = read_adc_data()  # read line by line, use delay on MCU time
         loopCompletions += 1
         adc_data.append(adc_data_partial)
 
