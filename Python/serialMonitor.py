@@ -14,7 +14,7 @@ import queue
 
 
 # Configure the serial port
-serial_port :str = 'COM3'  # Change this to your serial port
+serial_port :str = 'COM9'  # Change this to your serial port
 baud_rate :int = 921600      # This can be increased by updating menuconfig UART setup for esp32 chip - limited by CP2102 chip (to 1Mbps)
 # num_samples = 16*1024      # this should match the ADC_BUFFER_LEN from ESP32 code. Currently 8KB
 chunk_size: int = 8*1024 * 7    # How much data Python will read at once as a chunk. 8k lines from 16KB MCU buffer, each line 7 bytes
@@ -29,7 +29,7 @@ PY_TAG = "Py>\t"    # something to preface python prints to distinuish from MCU 
 
 VMAX = 960  # mV // max when using 0 attenuation
 DMAX = pow(2, 12) # 12-bit resolution
-DEFAULT_DIR = "./adc_data/"
+DEFAULT_DIR = "./pcnt_data/"
 
 # The serial object for communicating with MCU
 ser : serial.Serial = serial.Serial(serial_port, baud_rate, timeout=5)  # 5 second timeout on reads
@@ -51,9 +51,9 @@ def read_adc_data() -> dict[int, array]:
     # printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read
     line = ser.readline()
     print("PY > " + str(line.strip(), "utf-8"))
-    numBytes = line.split(b':')[1].strip()    # gets the last index (should be same as 1) and removes whitespace
+    numLines = line.split(b':')[1].strip()    # gets the last index (should be same as 1) and removes whitespace
     # Read and Parse each line of data (2 bytes of data, so numBytes/2 gives number of elements to read)
-    for i in range(int(int(numBytes, base=10) / 2)):  # adjust when >1 channel of data is sent
+    for i in range(int(int(numLines, base=10))):  # adjust when >1 channel of data is sent
         # ch: #; value: #(in hex)
         # (#),(0x#) // for speed, extra characters are eliminated
         #eventually some kind of time value will be included. Possibly the current clock cycle.
@@ -81,7 +81,7 @@ def read_adc_data() -> dict[int, array]:
         except ValueError:
             print("<read_adc_data> Error reading a value from serial data in")  
             print(f"This line of data: \"{str(line, encoding="utf-8")}\"")
-            print(f"Value of loop iterator {i=} of {numBytes=}; {loopCompletions=}; {total_read=}")
+            print(f"Value of loop iterator {i=} of {numLines=}; {loopCompletions=}; {total_read=}")
             exit(-1)
         except Exception as err:
             print(f"Unexpected Error: {err}\nType: {type(err)}")
@@ -128,6 +128,36 @@ def read_adc_chunk():
         total_read += 2
     return adc_raw
 
+#pulse counter reader
+def read_pcnt_data() -> dict[int, array]:
+    print("PY > Reading PCNT Data\n")
+    pcnt_data :dict[int, array] = dict()  # stores channel as key, and list (or better, an array) as value (data) (or np array)
+    pcnt_data[0] = array('B')
+    pcnt_data[1] = array('B')
+    pcnt_data[2] = array('B')
+    pcnt_data[3] = array('B')
+
+    time_data = array('B')
+    # printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read
+    line = ser.readline()
+    print("PY > " + str(line.strip(), "utf-8"))
+    numLines = line.split(b':')[1].strip()    # gets the last index (should be same as 1) and removes whitespace
+    # Read and Parse each line of data (2 bytes of data, so numBytes/2 gives number of elements to read)
+    for i in range(int(int(numLines, base=10))):  # adjust when >1 channel of data is sent
+        # Each line has time, and 4 ints. Store counts for each channel (known by position). Store time in separate struct
+        line = ser.readline()
+        lineS = line.split(b',')
+        try:
+            time_data[i] = int(lineS[0], base=10)
+            pcnt_data[0] = int(lineS[1])
+            pcnt_data[1] = int(lineS[2])
+            pcnt_data[2] = int(lineS[3])
+            pcnt_data[3] = int(lineS[4])
+
+        except:
+            print('Error in reading pcnt data')
+
+    
 # New function to handle user input and display help
 def send_user_commands():
     """Handles user input commands asynchronously."""
