@@ -202,7 +202,7 @@ static const char *menuUnit[] = { "kHz", "ms ", "   "}; //third unit is for a ye
 static const char *servoStatus[] = {"OFF", " ON"};  //default is off, turn on with rot_switch when on this menu.
 // ----- -----
 // --- Parameters ---
-uint32_t sample_frequency = DEFAULT_SAMPLE_FREQ;    // default 1MHz frequency
+uint32_t sample_frequency = DEFAULT_ADC_FREQ;    // default 1MHz frequency
 uint32_t sample_duration = 250;         // default 250ms 
 volatile uint32_t bytes_read = 0;   // no longer changes in ISR context, removed volatile. except volatile is used more than just from ISRs
 
@@ -1054,9 +1054,9 @@ static void adc_transfer_task(void* args) {
         ESP_LOGD(ADC_TRANS_TAG, "Metadata from file: Sample #%lu, start: %lu, size: %lu, freq: %lu, dur: %lu", 
                                                             d_num, d_start, num_sectors, s_freq, s_dur);// log debug information
         // add some error checking?
-        ESP_LOGI(ADC_TRANS_TAG, "Waiting 10s to allow time to read logs ... ");
+        ESP_LOGI(ADC_TRANS_TAG, "Waiting 5s to allow time to read logs ... ");
         // Now that we have the information from the file, we can call sdmmc_read_sector() to read the data in, but only read ADC_BUFFER_LEN at a time
-        vTaskDelay(10000/portTICK_PERIOD_MS);    // debug delay (to read logs above)
+        vTaskDelay(5000/portTICK_PERIOD_MS);    // debug delay (to read logs above)
         // send metadata to python here instead of in adc_task?
         uint8_t * result_buf = (uint8_t*) calloc(sizeof(uint8_t), ADC_BUFFER_LEN);  // malloc to get memory, and then free it after usage.
         if (result_buf == NULL) {
@@ -1412,7 +1412,7 @@ static void handle_command(const char* command, void* args) {
             int ret = sscanf(token, "%"PRIu32"", &sample_frequency);
             if (ret < 1) {
                 ESP_LOGE(UART_MON_TAG, "Invalid frequency for \"set\" command (%s).", token);
-                sample_frequency = DEFAULT_SAMPLE_FREQ;
+                sample_frequency = DEFAULT_ADC_FREQ;
                 return;
             }   // otherwise, integer read sucessfully
             // part 2, read the duration
@@ -1438,7 +1438,7 @@ static void handle_command(const char* command, void* args) {
             int ret = sscanf(token, "%"PRIu32"", &sample_frequency);
             if (ret < 1) {
                 ESP_LOGE(UART_MON_TAG, "Invalid frequency for \"setf\" command (%s).", token);
-                sample_frequency = DEFAULT_SAMPLE_FREQ;
+                sample_frequency = DEFAULT_ADC_FREQ;
                 return;
             }   // otherwise, integer read sucessfully
 
@@ -1621,7 +1621,7 @@ void app_main(void) {
     init_waveplate_uart();  // initialize the UART for the waveplate
 
     uart_flush(WAVE_UART_NUM);
-    send_waveplate_command( (const char*) "gs", NULL, 0);
+    send_waveplate_command( (const char*) "gs", 0, 0);
     vTaskDelay(1000/portTICK_PERIOD_MS);
     read_waveplate_response();// prints to screen
 

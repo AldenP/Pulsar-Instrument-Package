@@ -40,6 +40,7 @@
 #define ROTARY_B        GPIO_NUM_32     // switch for proper directional increments (clock wise = + increase)
 #define ROTARY_SWITCH   GPIO_NUM_25      // switch/press of dial
 
+// pins changed for ESP32WROOM32 chip/dev board - 23 24?
 #define LCD_SDA         GPIO_NUM_10     // SDA pin for i2c LCD (20x04) [green wire]
 #define LCD_SCL         GPIO_NUM_9      // SCL pin for i2c LCD
 
@@ -58,7 +59,7 @@
 
 #define PULSE_HIGH_COUNT        20000   // Counters are 16-bit signed
 #define PULSE_UNIT_STR(unit)    #unit   // macro to get number/string/identifier from unit handle?
-// SD card pins - also 3.3V and GND connection. (3.3V is important)
+// SD card pins - also 3.3V and GND connection. (3.3V is important) [these are fixed pins, included here for convenience]
 #define SD_CMD          GPIO_NUM_15     // brown wire
 #define SD_CLK          GPIO_NUM_14     // white wire
 #define SD_DETECT       GPIO_NUM_19     // gray wire - when high, SD card is inserted. Hardwire an LED --> loading effect drops voltage to ~1.7V
@@ -96,7 +97,7 @@
 #define DEFAULT_SAMPLE_FREQ                50000 // true default of 500,000 Hz (500kHz)
 #define DEFAULT_DURATION                250   //ms
 
-#define PULSE_DATA_BUF_LEN      12*512
+#define PULSE_DATA_BUF_LEN      6*512
 // Servos
 #pragma region 
 // Please consult the datasheet of your servo before changing the following parameters
@@ -133,7 +134,7 @@ static TaskHandle_t main_task_handle = NULL;
 static const char *MAIN_TAG = "MAIN-TASK";
 
 static TaskHandle_t copy_sample_handle = NULL;      //copy to SD card
-static const char *SAMPLE_COPY_TAG = "ADC-COPY";
+static const char *SAMPLE_COPY_TAG = "SAMP-COPY";
 #define COPY_TASK_PRIORITY      5
 
 static TaskHandle_t start_task_handle = NULL;       // starts sampling
@@ -508,12 +509,12 @@ static void IRAM_ATTR start_isr_handler(void* arg) {
     }   // else continue with debounce scheme
     // get ADC handler from arg
     my_handlers_t *handles = (my_handlers_t*) arg;
-    adc_continuous_handle_t *adc_handle = handles->adc_handle;
+    // adc_continuous_handle_t *adc_handle = handles->adc_handle;
     // debounce scheme first.
     gptimer_handle_t *t_handle = handles->gptimer;
-    gpio_intr_disable(START_BUT);   // logical error: had wrong GPIO tag
+    // gpio_intr_disable(START_BUT);   // logical error: had wrong GPIO tag
     // gptimer_set_raw_count(*t_handle, 0);
-    gptimer_start(*t_handle);
+    // gptimer_start(*t_handle);
 
     // provide visual output of pressing button.
     led_state = !led_state;
@@ -522,9 +523,9 @@ static void IRAM_ATTR start_isr_handler(void* arg) {
     // esp_err_t ret;
     BaseType_t mustYield = pdFALSE;
     // first see if ADC is off, and check that handle is null (both should follow each other)
-    if (!adc_state && (*adc_handle == NULL)) {
+    if (!sample_state) {
         // notify the adc task to initialize adc module, and start sampling.
-        vTaskNotifyGiveFromISR(adc_task_handle, &mustYield);
+        vTaskNotifyGiveFromISR(start_task_handle, &mustYield);
     }   //else it is already running, don't do anything.
     // void type doesn't need return...
 }
@@ -534,9 +535,9 @@ static void IRAM_ATTR aux_isr_handler(void* arg) {
         return;
     }   // else continue to debounce
     gptimer_handle_t *t_handle = ((my_handlers_t*)arg)->gptimer;
-    gpio_intr_disable(AUX_BUT); // also had logical error (had ROTARY_SWITCH instead)
+    // gpio_intr_disable(AUX_BUT); // also had logical error (had ROTARY_SWITCH instead)
     // gptimer_set_raw_count(*t_handle, 0);
-    gptimer_start(*t_handle);
+    // gptimer_start(*t_handle);
     // provide visual output of button press
     led_state = !led_state;
     gpio_set_level(GREEN_LED, led_state);   // to be ISR/IRAM safe, check config editor under GPIO.
@@ -560,9 +561,9 @@ static void IRAM_ATTR rot_switch_isr_handler(void* args) {
     gpio_set_level(GREEN_LED, led_state);   // visually indicated button push registered
     // debounce scheme first. (seems to need a long timer. )
     gptimer_handle_t *t_handle = (gptimer_handle_t*) args;  //get timer handle from args
-    gpio_intr_disable(ROTARY_SWITCH);   // prevent other interrupts
+    // gpio_intr_disable(ROTARY_SWITCH);   // prevent other interrupts
     // gptimer_set_raw_count(*t_handle, 0);
-    gptimer_start(*t_handle);
+    // gptimer_start(*t_handle);
     
     // now update position
     // if on pupil imaging menu, pressing dial will change it's state
@@ -603,7 +604,7 @@ static bool IRAM_ATTR on_counter_watch(pcnt_unit_handle_t unit, const pcnt_watch
 }
 static bool IRAM_ATTR on_debounce_alarm(gptimer_handle_t handle, const gptimer_alarm_event_data_t *edata, void* user_data) {
     // re-enable button interrupts, after stopping the timer
-    gptimer_stop(handle);
+    gptimer_stop((gptimer_handle_t)user_data);
     gpio_intr_enable(ROTARY_SWITCH);
     gpio_intr_enable(START_BUT);
     gpio_intr_enable(AUX_BUT);
@@ -619,20 +620,28 @@ static bool IRAM_ATTR on_debounce_alarm(gptimer_handle_t handle, const gptimer_a
  */
 static bool IRAM_ATTR on_segment_alarm(gptimer_handle_t handle, const gptimer_alarm_event_data_t *edata, void* user_data) {
     BaseType_t awoke = pdFALSE;
-    int32_t pulse_counts[4];
-    pcnt_unit_get_count(counter_handle1, pulse_counts[0]);
-    pcnt_unit_get_count(counter_handle2, pulse_counts[1]);
-    pcnt_unit_get_count(counter_handle3, pulse_counts[2]);
-    pcnt_unit_get_count(counter_handle4, pulse_counts[3]);
+    #pragma region 
+    // int32_t pulse_counts[4] = {0};
+    // ESP_ERROR_CHECK(pcnt_unit_get_count(counter_handle1, &pulse_counts[0]));
+    // ESP_ERROR_CHECK(pcnt_unit_get_count(counter_handle2, &pulse_counts[1]));
+    // ESP_ERROR_CHECK(pcnt_unit_get_count(counter_handle3, &pulse_counts[2]));
+    // ESP_ERROR_CHECK(pcnt_unit_get_count(counter_handle4, &pulse_counts[3]));
      
-    uint64_t time = 0;
-    gptimer_get_raw_count(handle, &time);    
-    pulse_data data = { 
-        .counts = pulse_counts,
-        .timer_count = time,
-    };
+    // uint64_t time = 0;
+    // ESP_ERROR_CHECK(gptimer_get_raw_count(handle, &time));    
+    // pulse_data data = { 
+    //     .counts = {
+    //         pulse_counts[0],
+    //         pulse_counts[1],
+    //         pulse_counts[2],
+    //         pulse_counts[3]
+    //     },
+    //     .timer_count = time,
+    // };
     // send data to copy task
-    xQueueSendFromISR(copy_queue, &data, &awoke);
+    // xQueueSendFromISR(copy_queue, &data, &awoke);
+    #pragma endregion
+    vTaskNotifyGiveFromISR(copy_sample_handle, &awoke);
     return (awoke == pdTRUE);
 }
 /**
@@ -697,6 +706,7 @@ static void sample_start_task(void* args) {
         
         // --- anything else?
         
+        suppress_logs(ESP_LOG_WARN);    // suppress the logs!
         
         ESP_LOGI(START_TASK_TAG, "Clearing PCNT counts...");
         pcnt_unit_clear_count(counter_handle1);
@@ -766,8 +776,9 @@ static void sample_start_task(void* args) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);    // wait for duration timer to awaken this task!
 
         sample_state = false;
+        ESP_LOGI(START_TASK_TAG, "Sampling finished.");
         xTaskNotifyGive(copy_sample_handle);    // notify copy that sample is over
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);    // wait until copy finished
+        vTaskSuspend(NULL);    // wait until copy finished
 
         // After re-awakening, disable timers so they can be adjusted later
         gptimer_disable(segment_timer); // assumes timer is stopped!
@@ -824,7 +835,16 @@ static void sample_start_task(void* args) {
         ESP_LOGD(START_TASK_TAG, "Sample variables saved to NVS successfully");
         #pragma endregion
         // inform/start transfer task
+        xTaskNotifyGive(sample_transfer_task_handle);
+        vTaskSuspend(NULL); // transfer task will resume!
 
+        unsuppress_logs(ESP_LOG_DEBUG);    // un-suppress the logs!
+        // restore logs if not suppressed.
+        if (!logs_suppressed) {
+            ESP_LOGI(START_TASK_TAG, "Resuming monitor logging");
+            esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);
+        }
+        
     }
 
 }
@@ -837,22 +857,47 @@ static void sample_start_task(void* args) {
 static void sample_copy_task(void* args) {
     // needs queue handle and SD card handle from args
     my_handlers_t* handles = (my_handlers_t*) args;
-    
+    // gptimer_handle_t* dur_timer = handles->gptimer;
     // TODO: add queue handle to my_handles? no, just make it global. ([TODO] initialized in main)
     pulse_data q_receive = { 0 };
-
-    pulse_data *buffer = (pulse_data*) calloc(PULSE_DATA_BUF_LEN, sizeof(pulse_data)); // 20B per struct. 
+    ESP_LOGD(SAMPLE_COPY_TAG, "Free heap memory: %lu", esp_get_free_heap_size());
+    pulse_data *buffer = (pulse_data*) heap_caps_malloc(PULSE_DATA_BUF_LEN * sizeof(pulse_data), MALLOC_CAP_8BIT);
+    // pulse_data* buffer = (pulse_data*) calloc(PULSE_DATA_BUF_LEN, sizeof(pulse_data)); // 20B per struct. 
+    if (buffer == NULL) {
+        ESP_LOGE(SAMPLE_COPY_TAG, "Error allocating buffer for pulse data!");
+        return;
+    }
     // size_t buf_len = 12*512;    // might make this into a macro definition instead
+    bool runOnce = false;
     size_t buf_idx = 0;
     while(1) {
-        // wait until data is received from on_segment_alarm
-        if(xQueueReceive(copy_queue, &q_receive, 1000/portTICK_PERIOD_MS)) {
-            // store q_receive into buffer
-            if (buf_idx < PULSE_DATA_BUF_LEN) { /* if buffer has room */
-                buffer[buf_idx++] = q_receive;  // increment index after statement executes!
-
-            } else {    // BUG: only runs if we sample long enough to fill a buffer!
+        // wait until data is received from on_segment_alarm (via notification)
+        ESP_LOGD(SAMPLE_COPY_TAG, "Copy task waiting for notification from timer...");
+        // configTASK_NOTIFICATION_ARRAY_ENTRIES    // hmm, it equals 1, so only 0 is valid? Requires different solution I guess. 
+        if (ulTaskNotifyTake(pdTRUE, 1000/portTICK_PERIOD_MS) ) {
+            ESP_LOGD(SAMPLE_COPY_TAG, "Getting data to store");
+            int32_t pulse_counts[4] = {0};
+            ESP_ERROR_CHECK(pcnt_unit_get_count(counter_handle1, &pulse_counts[0]));
+            ESP_ERROR_CHECK(pcnt_unit_get_count(counter_handle2, &pulse_counts[1]));
+            ESP_ERROR_CHECK(pcnt_unit_get_count(counter_handle3, &pulse_counts[2]));
+            ESP_ERROR_CHECK(pcnt_unit_get_count(counter_handle4, &pulse_counts[3]));
+            
+            uint64_t time = 0;
+            ESP_ERROR_CHECK(gptimer_get_raw_count(duration_timer, &time));    
+            pulse_data data = { 
+                .counts = {
+                    pulse_counts[0],
+                    pulse_counts[1],
+                    pulse_counts[2],
+                    pulse_counts[3]
+                },
+                .timer_count = time,
+            };
+            if (buf_idx < PULSE_DATA_BUF_LEN) 
+                buffer[buf_idx++] = data;   // if doesn't work, initialize it like data above
+            else {
                 // write buffer to SD card and hope it is fast enough!
+                ESP_LOGD(SAMPLE_COPY_TAG, "Writing buffer to SD card");
                 // use sample_start_sector to write buffer to SD card via raw access
                 size_t num_sectors = PULSE_DATA_BUF_LEN / 512; // sector size is 512 B. 
                 sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors);
@@ -861,18 +906,48 @@ static void sample_copy_task(void* args) {
                 buf_idx = 0;
                 buffer[buf_idx++] = q_receive;  // post-increment the index
             }
-        } else { /* solution for not having a large enough sample buffer */
+            runOnce = true;
+        } // here if it return 0, ie no notifications in last second
+        else if (!sample_state && runOnce) {
+            runOnce = false;    // prevent next time until new data acquired. 
+            ESP_LOGI(SAMPLE_COPY_TAG, "Copying leftover data to SD card");
             // after one second, check if sampling has stopped to write rest of the buffer to SD card
             // needs to be coordinated with other tasks, use notification instead
-            if (ulTaskNotifyTake(pdTRUE, 0)){
-                // export current buffer size to SD card
-                size_t num_sectors = buf_idx*sizeof(pulse_data) / 512; // sector size is 512 B. 
-                sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors);
-                sample_sector += num_sectors; //update sector start for next buffer (global variable)
-
-                xTaskNotifyGive(start_task_handle);
-            } // else just continue back to queue
+            // export current buffer size to SD card
+            size_t num_sectors = (buf_idx+1)*sizeof(pulse_data) / 512; // sector size is 512 B. 
+            sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors);
+            sample_sector += num_sectors; //update sector start for next buffer (global variable)
+            
+            buf_idx = 0;    // reset index for next time
+            vTaskResume(start_task_handle);
         }
+        // if(xQueueReceive(copy_queue, &q_receive, 1000/portTICK_PERIOD_MS) == pdTRUE) {
+        //     // store q_receive into buffer
+        //     if (buf_idx < PULSE_DATA_BUF_LEN) { /* if buffer has room */
+        //         buffer[buf_idx++] = q_receive;  // increment index after statement executes!
+
+        //     } else {    // BUG: only runs if we sample long enough to fill a buffer!
+        //         // write buffer to SD card and hope it is fast enough!
+        //         // use sample_start_sector to write buffer to SD card via raw access
+        //         size_t num_sectors = PULSE_DATA_BUF_LEN / 512; // sector size is 512 B. 
+        //         sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors);
+        //         sample_sector += num_sectors; //update sector start for next buffer (global variable)
+        //         // transfer is complete, store the data from this request
+        //         buf_idx = 0;
+        //         buffer[buf_idx++] = q_receive;  // post-increment the index
+        //     }
+        // } else { /* solution for not having a large enough sample buffer */
+        //     // after one second, check if sampling has stopped to write rest of the buffer to SD card
+        //     // needs to be coordinated with other tasks, use notification instead
+        //     if (ulTaskGenericNotifyTake(1,pdTRUE, 0)){
+        //         // export current buffer size to SD card
+        //         size_t num_sectors = buf_idx*sizeof(pulse_data) / 512; // sector size is 512 B. 
+        //         sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors);
+        //         sample_sector += num_sectors; //update sector start for next buffer (global variable)
+
+        //         xTaskNotifyGive(start_task_handle);
+        //     } // else just continue back to queue
+        // }
     }
     free(buffer);
 }
@@ -965,11 +1040,11 @@ static void sample_transfer_task(void* args) {
                 free(tmp_buf);
                 break;  // breaks this for loop only.
             }
-            printf("%s\nNum Lines: %ld", PY_TAG, PULSE_DATA_BUF_LEN);
+            printf("%s\nNum Lines: %u\n", PY_TAG, PULSE_DATA_BUF_LEN);
             // print data to terminal
             for (size_t i = 0; i < PULSE_DATA_BUF_LEN; i++) {
                 // format as timer count, then sensors 1-4
-                printf("%6llu, %ld, %ld, %ld, %ld", tmp_buf[i].timer_count, tmp_buf[i].counts[0],tmp_buf[i].counts[1],
+                printf("%6llu, %ld, %ld, %ld, %ld\n", tmp_buf[i].timer_count, tmp_buf[i].counts[0],tmp_buf[i].counts[1],
                             tmp_buf[i].counts[2], tmp_buf[i].counts[3]);
             }
 
@@ -985,23 +1060,25 @@ static void sample_transfer_task(void* args) {
                 continue;
             }
             size_t lines = last_set*512/sizeof(pulse_data); // I believe that to be the correct # of lines
-            printf("%s\nNum Lines: %ld", PY_TAG, lines);  
+            printf("%s\nNum Lines: %u\n", PY_TAG, lines);  
             // print data to terminal
             for (size_t i = 0; i < lines; i++) {
                 // format as timer count, then sensors 1-4
-                printf("%6llu, %ld, %ld, %ld, %ld", tmp_buf[i].timer_count, tmp_buf[i].counts[0],tmp_buf[i].counts[1],
+                printf("%6llu, %ld, %ld, %ld, %ld\n", tmp_buf[i].timer_count, tmp_buf[i].counts[0],tmp_buf[i].counts[1],
                             tmp_buf[i].counts[2], tmp_buf[i].counts[3]);
             }
             d_start += last_set;    // update address for a sanity check
         }
         // sanity check if data read matches expected amount.
-        if (d_start != num_sectors+tmp_start) {
+        if (d_start != num_sectors+tmp_start+last_set) {
             ESP_LOGE(TRANSFER_TAG, "Sanity Check failed! Ending sector doesn't match expected");
             ESP_LOGE(TRANSFER_TAG, "Start Sector: %ld, Num Sectors: %ld, End Sector: %ld", tmp_start, num_sectors, d_start);
-            free(tmp_buf);
-            continue;
+            // free(tmp_buf);
+            // continue;
         }
         // done reading data
+        free(tmp_buf);
+        vTaskResume(start_task_handle);
     }
 }
 // Task to periodically display debug or info messages on variable states, etc. Also updates vars from PCNT events.
@@ -1088,6 +1165,7 @@ static void uart_event_task(void *pvParameters) {
                 case UART_DATA:                    // If data is received
                     // Read the incoming data into the buffer
                     esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_NONE);  // reduce log statements
+                    esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_WARN);
                     uart_read_bytes(PC_UART_NUM, dtmp, event.size, portMAX_DELAY);  // only ever reads 1 byte at once (even CRLF is split!)
                     dtmp[event.size] = '\0';       // Null-terminate the string
                     // printf("Received %u bytes: %s (%X)\n", event.size, (char*) dtmp, dtmp[0]);  // Print received data
@@ -1100,8 +1178,10 @@ static void uart_event_task(void *pvParameters) {
                         handle_command(tmpStr, pvParameters);   // handle the command
                         memset(tmpStr, 0, UART_READ_BUF);   // clear the tmpStr
                         pStr = tmpStr;
-                        if (!logs_suppressed)    // restore log level only when not suppressed
+                        if (!logs_suppressed) {   // restore log level only when not suppressed
                             esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);     // restore log level (does so after suppress command! lol)
+                            esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_DEBUG);
+                        }
                         break;
                     }
                     // else add dtmp to tmpStr
@@ -1160,7 +1240,7 @@ static void uart_event_task(void *pvParameters) {
 // Command is string from console, args are handles for starting different tasks
 static void handle_command(const char* command, void* args) {
     my_handlers_t * handles = (my_handlers_t*) args;
-    adc_continuous_handle_t * adc_handle = handles->adc_handle;
+    // adc_continuous_handle_t * adc_handle = handles->adc_handle;
     // my_servos_t * servos = handles->servos;
 
     if (strcmp(command, "start") == 0) {           // Check if the command is "start"
@@ -1174,9 +1254,9 @@ static void handle_command(const char* command, void* args) {
         gpio_set_level(GREEN_LED, led_state);
         
         // first see if ADC is off, and check that handle is null (both should follow each other)
-        if (!adc_state && (*adc_handle == NULL)) {
+        if (!sample_state) {
             // notify the adc task to initialize adc module, and start sampling.
-            xTaskNotifyGive(adc_task_handle);
+            xTaskNotifyGive(start_task_handle);
         }   //else it is already running, don't do anything.
     } else if (strcmp(command, "pupil") == 0) {
         pupil_path_state = !pupil_path_state;
@@ -1304,9 +1384,9 @@ static void suppress_logs(esp_log_level_t general_level) {
     esp_log_level_set("*", ESP_LOG_WARN);   // suppresses all monitor logs, and logs from other files
     esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_WARN);  // explicitly suppress this one.
     // make it so that select tasks have higher log levels
-    esp_log_level_set(ADC_TASK_TAG, general_level);   // really just needs info level
-    esp_log_level_set(ADC_COPY_TAG, general_level);
-    esp_log_level_set(ADC_TRANS_TAG, general_level);
+    esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_WARN);   // really just needs info level
+    esp_log_level_set(START_TASK_TAG, general_level);
+    esp_log_level_set(TRANSFER_TAG, general_level);
     esp_log_level_set(MAIN_TAG, general_level);     // in loop, main has no logs!
     esp_log_level_set(UART_MON_TAG, ESP_LOG_INFO);  // should always be on info!
     esp_log_level_set(SERVO_TASK_TAG, ESP_LOG_INFO);
@@ -1326,11 +1406,97 @@ static void unsuppress_logs(esp_log_level_t global_level) {
     if (global_level < ESP_LOG_INFO) {
         esp_log_level_set(UART_MON_TAG, ESP_LOG_INFO);
         esp_log_level_set(SERVO_TASK_TAG, ESP_LOG_INFO);
-        esp_log_level_set(ADC_TRANS_TAG, ESP_LOG_INFO);
-        esp_log_level_set(ADC_COPY_TAG, ESP_LOG_INFO);
-        esp_log_level_set(ADC_TASK_TAG, ESP_LOG_INFO);
+        esp_log_level_set(TRANSFER_TAG, ESP_LOG_DEBUG);
+        esp_log_level_set(START_TASK_TAG, ESP_LOG_INFO);
+        esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_INFO);
     }
     logs_suppressed = false;
+}
+
+static TaskHandle_t init_1_handle = NULL;
+/**
+ * Function to allocate resources on core 1, so interrupts are attached there.
+ * This is a workaround fix since all init. code is on core 0
+ */
+static void core_1_initializer(void* args) {
+    // starts as a task, will return at the end.
+    esp_err_t ret;
+    my_handlers_t * handles = (my_handlers_t*) args; //malloc(sizeof(my_handlers_t));
+    // memset(handles, 0, sizeof(my_handlers_t));  // set to zero
+    ESP_LOGI(MAIN_TAG, "Core 1 Initializer. Free heap memory: %"PRIu32"", esp_get_free_heap_size());
+    heap_caps_check_integrity_all(true);
+    // --- GPTimer / Debounce Timer ---
+    #pragma region
+    ESP_LOGI(MAIN_TAG, "Initializing GPTimer peripheral for debouncing");
+    gptimer_handle_t timer_handle = NULL;
+    gptimer_config_t timer_conf = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .intr_priority = 0,
+        .resolution_hz = 10*1000,   //10kHz = 0.1ms ticks
+        // .flags.intr_shared
+    };
+    
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_conf, &timer_handle));
+    // setup the alarm for timer
+    gptimer_alarm_config_t timer_alarm_conf = {
+        .alarm_count = DEBOUNCE_TIME_MS*10,   // time in ms * 10ticks/ms
+        .reload_count = 0,
+        .flags.auto_reload_on_alarm = true   // reloads alarm to reload count immediately after alarm. Will do this in ISR
+    };
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(timer_handle, &timer_alarm_conf));
+    // callback function
+    gptimer_event_callbacks_t timer_cbs_conf =  {
+        .on_alarm = on_debounce_alarm,
+    };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timer_handle, &timer_cbs_conf, (void*)timer_handle));
+    ESP_ERROR_CHECK(gptimer_enable(timer_handle));
+    ESP_LOGI(MAIN_TAG, "Debounce timer initialized and enabled");
+    #pragma endregion
+    // --- GPTimers for pulse segments and duration/period
+    #pragma region 
+    ESP_LOGI(MAIN_TAG, "Creating Segment and Duration timers");
+    // adjuct config/params for segment timer
+    // gptimer_config_t timer_conf = {0};
+    timer_conf.clk_src = GPTIMER_CLK_SRC_APB;   // 80 MHz
+    timer_conf.direction = GPTIMER_COUNT_UP;
+    timer_conf.intr_priority = 2;
+    timer_conf.resolution_hz = 10000000;    // 10 MHz - fast enough for 1MHz sampling
+
+    // gptimer_handle_t segment_timer = NULL;
+    // gptimer_handle_t duration_timer = NULL;
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_conf, &segment_timer));
+    // Adjust params for duration timer
+    timer_conf.intr_priority = 1;   // change resolution? 
+    timer_conf.resolution_hz = 10000;   // 10kHz
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_conf, &duration_timer));
+    // alarm config must wait until sample duration and frequency are known!
+    // but we can do callbacks now!
+    // gptimer_event_callbacks_t timer_cbs_conf = {0};
+    timer_cbs_conf.on_alarm = on_segment_alarm;
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(segment_timer, &timer_cbs_conf, (void*)NULL));
+    timer_cbs_conf.on_alarm = on_duration_alarm;
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(duration_timer, &timer_cbs_conf, (void*)NULL));
+    #pragma endregion
+    // --- SD Card / SDMMC ---
+    #pragma region
+    esp_intr_dump(stdout);
+    ESP_LOGI(MAIN_TAG, "Waiting to initialize SD card (2s). Ensure clock wire is secured.");
+    vTaskDelay(2000/portTICK_PERIOD_MS);
+
+    ESP_LOGI(MAIN_TAG, "Initializing SD card for raw access");
+    init_sd_config(&host_g, &slot_config_g, SD_FREQUENCY);
+    sdmmc_card_t *card;
+
+    ESP_LOGI(MAIN_TAG, "Mounting SD card - raw access");
+    ret = init_sd_card(&card);
+    ESP_ERROR_CHECK(ret);
+    #pragma endregion
+    // before function terminates, update my_handles over to main.
+    handles->gptimer = timer_handle;    // these are pointers, so the memory is allocated by the called functions.
+    handles->card = card;
+    vTaskResume(main_task_handle);
+    vTaskDelete(NULL);  // remove this task to free resources
 }
 
 void app_main(void) {
@@ -1344,6 +1510,7 @@ void app_main(void) {
     esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);
     esp_log_level_set("sdmmc_req", ESP_LOG_DEBUG);
     esp_log_level_set("sdmmc_cmd", ESP_LOG_DEBUG);
+    
     // ---- gpio setup ----
     // -- gpio inputs
     gpio_config_t io_conf = {};
@@ -1375,9 +1542,9 @@ void app_main(void) {
     
     ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT));    //enable ISRs to be added.
     // ----------
-    // --- GPTimer / Debounce Timer ---
+    // --- GPTimer / Debounce Timer --- moved
     #pragma region
-    ESP_LOGI(MAIN_TAG, "Initializing GPTimer peripheral for debouncing");
+    /* ESP_LOGI(MAIN_TAG, "Initializing GPTimer peripheral for debouncing");
     gptimer_handle_t timer_handle = NULL;
     gptimer_config_t timer_conf = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
@@ -1400,10 +1567,12 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(gptimer_register_event_callbacks(timer_handle, &timer_cbs_conf, (void*)NULL));
     ESP_ERROR_CHECK(gptimer_enable(timer_handle));
-    ESP_LOGI(MAIN_TAG, "Debounce timer initialized and enabled");
+    ESP_LOGI(MAIN_TAG, "Debounce timer initialized and enabled"); */
     #pragma endregion
-    // --- GPTimers for pulse segments and duration/period
+    /* // --- GPTimers for pulse segments and duration/period
+    ESP_LOGI(MAIN_TAG, "Creating Segment and Duration timers");
     // adjuct config/params for segment timer
+    gptimer_config_t timer_conf = {0};
     timer_conf.clk_src = GPTIMER_CLK_SRC_APB;   // 80 MHz
     timer_conf.direction = GPTIMER_COUNT_UP;
     timer_conf.intr_priority = 2;
@@ -1418,18 +1587,19 @@ void app_main(void) {
     ESP_ERROR_CHECK(gptimer_new_timer(&timer_conf, &duration_timer));
     // alarm config must wait until sample duration and frequency are known!
     // but we can do callbacks now!
+    gptimer_event_callbacks_t timer_cbs_conf = {0};
     timer_cbs_conf.on_alarm = on_segment_alarm;
     ESP_ERROR_CHECK(gptimer_register_event_callbacks(segment_timer, &timer_cbs_conf, (void*)NULL));
     timer_cbs_conf.on_alarm = on_duration_alarm;
     ESP_ERROR_CHECK(gptimer_register_event_callbacks(duration_timer, &timer_cbs_conf, (void*)NULL));
-
+ */
     // --- PCNT for Sampling ---
     #pragma region 
     ESP_LOGI(MAIN_TAG, "Initializing pulse counters for data sampling");
     pcnt_unit_config_t unit_conf = {
         .high_limit = PULSE_HIGH_COUNT,         // counters are 16bit (64k, or rather +- 32k)
         .low_limit = -1,
-        .intr_priority = 1,
+        .intr_priority = 0,
         .flags.accum_count = true,   // uses accumulator if counter overflows. May be useful for a long sample duration. 
     };
     // moved to global!
@@ -1576,13 +1746,16 @@ void app_main(void) {
     // --- Rotary Encoder ---
     #pragma region
     ESP_LOGI(MAIN_TAG, "Installing pcnt (pulse count) unit for dial");  //peripheral for the rotary encoder dial
-    pcnt_unit_config_t unit_config = {
-        .high_limit = ROTARY_HIGH,
-        .low_limit = ROTARY_LOW,
-        .intr_priority = 1,     // must be equal between all units!
-    };
+    // pcnt_unit_config_t unit_config = {
+    //     .high_limit = ROTARY_HIGH,
+    //     .low_limit = ROTARY_LOW,
+    //     .intr_priority = 1,     // must be equal between all units!
+    // };
+    unit_conf.high_limit = ROTARY_HIGH;
+    unit_conf.low_limit = ROTARY_LOW;
+
     pcnt_unit_handle_t rotary_counter = NULL;
-    ESP_ERROR_CHECK(pcnt_new_unit(&unit_config, &rotary_counter));
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_conf, &rotary_counter));
 
     ESP_LOGI(MAIN_TAG, "PCNT: setting glitch filter");
     pcnt_glitch_filter_config_t filter_config = {
@@ -1704,55 +1877,17 @@ void app_main(void) {
     #pragma endregion
     // --- SD Card / SDMMC ---
     #pragma region
+    /* esp_intr_dump(stdout);
     ESP_LOGI(MAIN_TAG, "Waiting to initialize SD card (2s). Ensure clock wire is secured.");
     vTaskDelay(2000/portTICK_PERIOD_MS);
 
-#if USE_RAW_SD
     ESP_LOGI(MAIN_TAG, "Initializing SD card for raw access");
     init_sd_config(&host_g, &slot_config_g, SD_FREQUENCY);
     sdmmc_card_t *card;
 
     ESP_LOGI(MAIN_TAG, "Mounting SD card - raw access");
     ret = init_sd_card(&card);
-    ESP_ERROR_CHECK(ret);
-#else
-    esp_vfs_fat_sdmmc_mount_config_t mount_conf = {
-        .format_if_mount_failed = FORMAT_IF_MOUNT_FAILS,
-        .max_files = 8,    // max # of open files
-        .allocation_unit_size = KB_TO_BYTES(16)   //bigger is better for large file R/W. cost is overhead on small files
-    };
-    sdmmc_card_t * card_handle;
-    const char mount_point[] = SD_MOUNT;    // "/sdcard"
-    ESP_LOGI(MAIN_TAG, "Initializing SD card");
-    ESP_LOGI(MAIN_TAG, "Using SDMMC peripheral");
-    // default host handle will set max frequency to 20MHz and 4 bit mode.
-    // this is sufficent, (10 *10^6 B/s, vs. 8 *10^6 B/s) 
-    sdmmc_host_t host_handle = SDMMC_HOST_DEFAULT();
-    host_handle.max_freq_khz = SD_FREQUENCY; // if 40MHz is possible/ needed
-
-    // power is supplied via breakout SD card board (3.3V pullups))
-    // Configure the sdmmc slot using default values. 
-    sdmmc_slot_config_t slot_conf = SDMMC_SLOT_CONFIG_DEFAULT();
-    // slot_conf.gpio_cd = SD_DETECT;  // we will use the SD detect to prevent ADC from running if no place to put data!
-    slot_conf.width = SD_LINE_WIDTH;    // configurable line width
-    // External pullups are used, so internal pullups unnecessary.
-    slot_conf.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-    ESP_LOGI(MAIN_TAG, "Mounting filesystem");
-    ret = esp_vfs_fat_sdmmc_mount(mount_point, &host_handle, &slot_conf, &mount_conf, &card_handle);
-
-    if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            ESP_LOGE(MAIN_TAG, "Failed to mount filesystem. ");
-        } else {
-            ESP_LOGE(MAIN_TAG, "Failed to initialize the card (%s). "
-                     "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
-        }
-        return;
-    }
-    ESP_LOGI(MAIN_TAG, "Filesystem mounted!");
-    sdmmc_card_print_info(stdout, card_handle); // prints info on the SD card connected
-    // ESP_LOGW(MAIN_TAG, "SD card not yet implemented, filesystem NOT mounted!");
-#endif
+    ESP_ERROR_CHECK(ret); */
     #pragma endregion
     // --- PC UART Monitor ---
     #pragma region
@@ -1858,18 +1993,7 @@ void app_main(void) {
     }
 #pragma endregion
     
-#if USE_SD_CARD
-    // create log file folder, if it doesn't already exist
-    char tmpBuf[64] = {0};
-    sprintf(tmpBuf, "%s%s/", SD_MOUNT, SAMPLE_LOG_DIR);
-    struct stat st;
-    if (stat(tmpBuf, &st) != 0) {
-        // then an error occured, likely a dir not found
-        mkdir(tmpBuf, ACCESSPERMS);
-        ESP_LOGI(ADC_TASK_TAG, "Directory created for sample logs: %s", tmpBuf);
-    } // else stat will have info on the folder.
-#endif
-    adc_continuous_handle_t handle = NULL;  //needed in many places, hold it here for distribution.
+    // adc_continuous_handle_t handle = NULL;  //needed in many places, hold it here for distribution.
 
     my_servos_t servo_handles = {
         .comp1 = &comparator1,
@@ -1877,15 +2001,24 @@ void app_main(void) {
     };
     my_handlers_t handles = {
         // .adc_handle = &handle,
-        .gptimer = &timer_handle,
+        // .gptimer = &timer_handle,
         .servos = &servo_handles,
-        .card = card,   //card is already a pointer
+        // .card = card,   //card is already a pointer
     };
+    // run core1_initializer
+    TaskHandle_t init_1_handle = NULL;
+    xTaskCreatePinnedToCore(core_1_initializer, "CORE_1-INIT", 8*1024, (void*)&handles, 0, &init_1_handle, 1);
+    vTaskSuspend(NULL); // core_1 will resume this task
+    sdmmc_card_t* card = handles.card;   // get card after it is initialized by core1 initializer
+
     ESP_LOGI(MAIN_TAG, "Installing GPIO ISRs, then creating tasks");
     // Install GPIO ISRs
     gpio_isr_handler_add(START_BUT, start_isr_handler, (void*)&handles);
     gpio_isr_handler_add(AUX_BUT, aux_isr_handler, (void*)&handles);
-    gpio_isr_handler_add(ROTARY_SWITCH, rot_switch_isr_handler, (void*)&timer_handle);
+    gpio_isr_handler_add(ROTARY_SWITCH, rot_switch_isr_handler, (void*)(handles.gptimer));
+
+    // forgot to initialize this queue
+    copy_queue = xQueueCreate(20, sizeof(pulse_data));
 
     // register tasks: adc_task, adc_copy (to SD card), adc_transfer (from SD card to PC/python), monitor_vars (logging), servo (control)
     // xTaskCreatePinnedToCore(adc_task, "ADC-TASK", TASK_STACK_SIZE, (void*)&handles, ADC_TASK_PRIORITY, (void*)&adc_task_handle, 1);    
@@ -1898,7 +2031,7 @@ void app_main(void) {
     // Sample Tasks. Copy on Core 1, transfer on Core 1, and let start be on either
     xTaskCreatePinnedToCore(sample_copy_task, "COPY-TASK" ,TASK_STACK_SIZE, (void*)&handles, COPY_TASK_PRIORITY, &copy_sample_handle, 1);
     xTaskCreatePinnedToCore(sample_start_task, "START-TASK", TASK_STACK_SIZE, (void*)NULL, START_TASK_PRIORITY, &start_task_handle, tskNO_AFFINITY);
-
+    xTaskCreatePinnedToCore(sample_transfer_task, "TRANSFER-TASK", TASK_STACK_SIZE, (void*)&handles, SAMPLE_TRANSFER_PRIORITY, &sample_transfer_task_handle, 1);
     // Task for updating variables from PCNT events, and printing log messages.
     xTaskCreatePinnedToCore(monitor_var_task, "MONITOR-TASK", KB_TO_BYTES(2), (void*)&monitor_data, MONITOR_TASK_PRIORITY, &monitor_handle, 0);
     // servo task creation
@@ -1923,13 +2056,13 @@ void app_main(void) {
     while(1) {
         // if (adc_state) => print "ADC running" or "Sampling", else "ADC off"/"Standby"
         // placed before other section because cursor would be in different location. 
-        if (adc_state) { 
+        if (sample_state) { 
             // lcd1602_set_cursor(lcd_ctx, 1, 19);// lcd1602_string(lcd_ctx, BLANK_LINE);    // this causes the text to flash by updating...
-            snprintf(strBuf, 22, " %-20s", "ADC Running...");
+            snprintf(strBuf, 22, " %-20s", "    Sampling...");
             lcd1602_set_cursor(lcd_ctx, 1, 19);
             lcd1602_string(lcd_ctx, strBuf);
         } else {
-            snprintf(strBuf, 22, " %-20s", "ADC Off / Standby");
+            snprintf(strBuf, 22, " %-20s", "    Standby");
             lcd1602_set_cursor(lcd_ctx, 1, 19);
             lcd1602_string(lcd_ctx, strBuf);
         }
