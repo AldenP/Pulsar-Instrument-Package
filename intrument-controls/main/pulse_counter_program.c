@@ -70,7 +70,8 @@
 #define SD_DAT3         GPIO_NUM_13     // orange wire
 // - SD Params -
 #define SD_LINE_WIDTH   4               // want 4-line/bit width, but doesn't work, so 1-line it is (for now)
-#define SD_FREQUENCY    SDMMC_FREQ_HIGHSPEED    // 40MHz fastest, default is 20MHz, and probing (slowest) is 400kHz
+#define SD_FREQUENCY    SDMMC_FREQ_DEFAULT    // 40MHz fastest, default is 20MHz, and probing (slowest) is 400kHz
+    // problem with SD card could be impedence mismatching
 // --- LEDs ---
 #define GREEN_LED       GPIO_NUM_0      // General debug LED (button presses)
 #define RED_LED         GPIO_NUM_5      // ADC on/off status LED
@@ -452,7 +453,7 @@ void init_sd_config(sdmmc_host_t *out_host, sdmmc_slot_config_t *out_slot_config
     // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     // TODO: add card detect (CD)
-    
+    slot_config.gpio_cd = SD_DETECT;
     // Set bus width to use:
     slot_config.width = 4;
 
@@ -604,7 +605,7 @@ static bool IRAM_ATTR on_counter_watch(pcnt_unit_handle_t unit, const pcnt_watch
 }
 static bool IRAM_ATTR on_debounce_alarm(gptimer_handle_t handle, const gptimer_alarm_event_data_t *edata, void* user_data) {
     // re-enable button interrupts, after stopping the timer
-    gptimer_stop((gptimer_handle_t)user_data);
+    ESP_ERROR_CHECK(gptimer_stop((gptimer_handle_t)user_data));
     gpio_intr_enable(ROTARY_SWITCH);
     gpio_intr_enable(START_BUT);
     gpio_intr_enable(AUX_BUT);
@@ -706,7 +707,8 @@ static void sample_start_task(void* args) {
         
         // --- anything else?
         
-        suppress_logs(ESP_LOG_WARN);    // suppress the logs!
+        suppress_logs(ESP_LOG_INFO);    // suppress the logs!
+        esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_DEBUG);
         
         ESP_LOGI(START_TASK_TAG, "Clearing PCNT counts...");
         pcnt_unit_clear_count(counter_handle1);
@@ -727,7 +729,7 @@ static void sample_start_task(void* args) {
             continue;
         }
 
-        alarm_conf.alarm_count = 10*sample_duration;
+        alarm_conf.alarm_count = 10*sample_duration;    // dur is in ms. 10 ticks per ms.
         alarm_conf.flags.auto_reload_on_alarm = false;
         ret = gptimer_set_alarm_action(duration_timer, &alarm_conf);
         if (ret != ESP_OK) {
@@ -735,6 +737,10 @@ static void sample_start_task(void* args) {
             continue;
         }
         ESP_LOGI(START_TASK_TAG, "Enabling Timers");
+        
+        // explicitly set the timer counts
+        gptimer_set_raw_count(duration_timer, 0);
+        gptimer_set_raw_count(segment_timer, 0);
         // enable the timers. They are ready now.
         ESP_ERROR_CHECK(gptimer_enable(duration_timer));
         ESP_ERROR_CHECK(gptimer_enable(segment_timer));
@@ -834,9 +840,12 @@ static void sample_start_task(void* args) {
         }
         ESP_LOGD(START_TASK_TAG, "Sample variables saved to NVS successfully");
         #pragma endregion
+        ESP_LOGI(START_TASK_TAG, "Delaying transfer task to read logs (10s)");
+        // vTaskDelay(10000/portTICK_PERIOD_MS);
+
         // inform/start transfer task
-        xTaskNotifyGive(sample_transfer_task_handle);
-        vTaskSuspend(NULL); // transfer task will resume!
+        // xTaskNotifyGive(sample_transfer_task_handle);
+        // vTaskSuspend(NULL); // transfer task will resume!
 
         unsuppress_logs(ESP_LOG_DEBUG);    // un-suppress the logs!
         // restore logs if not suppressed.
@@ -859,7 +868,7 @@ static void sample_copy_task(void* args) {
     my_handlers_t* handles = (my_handlers_t*) args;
     // gptimer_handle_t* dur_timer = handles->gptimer;
     // TODO: add queue handle to my_handles? no, just make it global. ([TODO] initialized in main)
-    pulse_data q_receive = { 0 };
+    // pulse_data q_receive = { 0 };
     ESP_LOGD(SAMPLE_COPY_TAG, "Free heap memory: %lu", esp_get_free_heap_size());
     pulse_data *buffer = (pulse_data*) heap_caps_malloc(PULSE_DATA_BUF_LEN * sizeof(pulse_data), MALLOC_CAP_8BIT);
     // pulse_data* buffer = (pulse_data*) calloc(PULSE_DATA_BUF_LEN, sizeof(pulse_data)); // 20B per struct. 
@@ -884,38 +893,54 @@ static void sample_copy_task(void* args) {
             
             uint64_t time = 0;
             ESP_ERROR_CHECK(gptimer_get_raw_count(duration_timer, &time));    
-            pulse_data data = { 
-                .counts = {
-                    pulse_counts[0],
-                    pulse_counts[1],
-                    pulse_counts[2],
-                    pulse_counts[3]
-                },
-                .timer_count = time,
-            };
-            if (buf_idx < PULSE_DATA_BUF_LEN) 
-                buffer[buf_idx++] = data;   // if doesn't work, initialize it like data above
+            ESP_LOGD(SAMPLE_COPY_TAG, "Counts: %lu, %lu, %lu, %lu; Time: %llu", pulse_counts[0], pulse_counts[1],
+                pulse_counts[2],pulse_counts[3], time); // verify what data comes in. 
+            // pulse_data data = { 
+            //     .counts = {
+            //         pulse_counts[0],
+            //         pulse_counts[1],
+            //         pulse_counts[2],
+            //         pulse_counts[3]
+            //     },
+            //     .timer_count = time,
+            // };
+            if (buf_idx < PULSE_DATA_BUF_LEN) {
+                buffer[buf_idx].counts[0] = pulse_counts[0]; // should be a copy, and not pass by ref. 
+                buffer[buf_idx].counts[1] = pulse_counts[1];
+                buffer[buf_idx].counts[2] = pulse_counts[2];
+                buffer[buf_idx].counts[3] = pulse_counts[3];
+                buffer[buf_idx].timer_count = time;
+                buf_idx++;
+            }  // if doesn't work, initialize it like data above
             else {
                 // write buffer to SD card and hope it is fast enough!
-                ESP_LOGD(SAMPLE_COPY_TAG, "Writing buffer to SD card");
+                ESP_LOGI(SAMPLE_COPY_TAG, "Writing buffer to SD card");
                 // use sample_start_sector to write buffer to SD card via raw access
                 size_t num_sectors = PULSE_DATA_BUF_LEN / 512; // sector size is 512 B. 
-                sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors);
+                ESP_ERROR_CHECK(sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors));
                 sample_sector += num_sectors; //update sector start for next buffer (global variable)
                 // transfer is complete, store the data from this request
                 buf_idx = 0;
-                buffer[buf_idx++] = q_receive;  // post-increment the index
+                buffer[buf_idx].counts[0] = pulse_counts[0]; // should be a copy, and not pass by ref. 
+                buffer[buf_idx].counts[1] = pulse_counts[1];
+                buffer[buf_idx].counts[2] = pulse_counts[2];
+                buffer[buf_idx].counts[3] = pulse_counts[3];
+                buffer[buf_idx].timer_count = time;
+                buf_idx++;
             }
-            runOnce = true;
+            runOnce = true;     // must be notified once to be true
         } // here if it return 0, ie no notifications in last second
-        else if (!sample_state && runOnce) {
+        else if (!sample_state && runOnce) {    // must be notified once, and the sample_state must be false. sample_state is true before this task is notified.
             runOnce = false;    // prevent next time until new data acquired. 
             ESP_LOGI(SAMPLE_COPY_TAG, "Copying leftover data to SD card");
             // after one second, check if sampling has stopped to write rest of the buffer to SD card
             // needs to be coordinated with other tasks, use notification instead
             // export current buffer size to SD card
             size_t num_sectors = (buf_idx+1)*sizeof(pulse_data) / 512; // sector size is 512 B. 
-            sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors);
+            if (num_sectors < 1) {
+                num_sectors = 1;
+            }
+            ESP_ERROR_CHECK(sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors));
             sample_sector += num_sectors; //update sector start for next buffer (global variable)
             
             buf_idx = 0;    // reset index for next time
@@ -964,7 +989,7 @@ static void sample_transfer_task(void* args) {
     sdmmc_card_t* card = handles->card;
 
     char data_buf[256] = {0};   // buffer to store the contents of the log file
-    char log_file[64] = {0};    // buffer to hold log file
+    char log_file[128] = {0};    // buffer to hold log file
     uint32_t num_sectors = 0;  // number of sectors
 
     ESP_LOGI(TRANSFER_TAG, "Transfer task successfully initialized.");
@@ -1029,10 +1054,17 @@ static void sample_transfer_task(void* args) {
         uint32_t tmp_start = d_start;
         // prepare to loop over a set number of sectors
         // total sectors / number of sectors per buffer *full*
-        size_t step_sectors = num_sectors / (PULSE_DATA_BUF_LEN/512);   // ISSUE: last buffer might not be full! 
+        // size_t step_sectors = num_sectors / (PULSE_DATA_BUF_LEN/512);   // ISSUE: last buffer might not be full! 
+        size_t step_sectors = PULSE_DATA_BUF_LEN / 512;
+        // Logical Bug: step_sectors should be DATA_BUF_LEN / 512 (6), and total number of iterations = num_sectors/6
+        if (step_sectors == 0) {
+            ESP_LOGE(TRANSFER_TAG, "step_sectors is zero! Breaking loop");
+            free(tmp_buf);
+            break;
+        }
         size_t last_set = num_sectors % (PULSE_DATA_BUF_LEN/512);   // gives the number of sectors that were written at end of copy task
         // tell python number of loops, and how much per loop? 
-        for (int transferred = 0; transferred < num_sectors; transferred += step_sectors) {
+        for (size_t transferred = 0; transferred < num_sectors; transferred += step_sectors) {
             // read from d_start into the tmp_buf  
             ret = sdmmc_read_sectors(card, tmp_buf, d_start, step_sectors);
             if (ret != ESP_OK) {
@@ -1060,6 +1092,7 @@ static void sample_transfer_task(void* args) {
                 continue;
             }
             size_t lines = last_set*512/sizeof(pulse_data); // I believe that to be the correct # of lines
+            ESP_LOGD(TRANSFER_TAG, "Last set of data (lines: %u)", lines);
             printf("%s\nNum Lines: %u\n", PY_TAG, lines);  
             // print data to terminal
             for (size_t i = 0; i < lines; i++) {
@@ -1072,7 +1105,7 @@ static void sample_transfer_task(void* args) {
         // sanity check if data read matches expected amount.
         if (d_start != num_sectors+tmp_start+last_set) {
             ESP_LOGE(TRANSFER_TAG, "Sanity Check failed! Ending sector doesn't match expected");
-            ESP_LOGE(TRANSFER_TAG, "Start Sector: %ld, Num Sectors: %ld, End Sector: %ld", tmp_start, num_sectors, d_start);
+            ESP_LOGE(TRANSFER_TAG, "Start Sector: %lu, Num Sectors: %lu, Last Set: %u, End Sector: %lu", tmp_start, num_sectors, last_set, d_start);
             // free(tmp_buf);
             // continue;
         }
@@ -1094,7 +1127,7 @@ static void monitor_var_task(void* args) {
 
         // report PCNT count; problem: will only update every second because of delay to prevent log spamming. 
         if (xQueueReceive(*(user_data->event_queue), &event_count, 1000/portTICK_PERIOD_MS)) { // blocks for 1s waiting to see if update to counter
-            ESP_LOGI(MONITOR_TASK_TAG, "PCNT Event Count: %d", event_count);
+            ESP_LOGI(MONITOR_TASK_TAG, "Rotary PCNT Event Count: %d", event_count);
             // adjust the relevent parameter
             taskENTER_CRITICAL(&param_lock);    // protect sample params from concurrency issues! if this is problem, relocate closer
             if (menuIndex == 0) {
@@ -1112,12 +1145,12 @@ static void monitor_var_task(void* args) {
         } else  {  // else print some debugging logs
             // add some logic to prevent log spam without a delay that affects the other functionality?
             ESP_ERROR_CHECK(pcnt_unit_get_count(*(user_data->pcnt_handle), &pulse_count));
-            ESP_LOGI(MONITOR_TASK_TAG, "PCNT Current Count: %d", pulse_count);
+            ESP_LOGI(MONITOR_TASK_TAG, "Rotary PCNT Current Count: %d", pulse_count);
             
             // debug level logs
             // ESP_LOGD(MONITOR_TASK_TAG, "adc_state: %d", adc_state);  // visually shown with LED
             ESP_LOGD(MONITOR_TASK_TAG, "servo state: %d", pupil_path_state);    // not shown with LED
-            ESP_LOGD(MONITOR_TASK_TAG, "bytes_read: %"PRIu32"", bytes_read);
+            // ESP_LOGD(MONITOR_TASK_TAG, "bytes_read: %"PRIu32"", bytes_read);
             ESP_LOGD(MONITOR_TASK_TAG, "Free heap memory: %"PRIu32"", esp_get_free_heap_size());
             // ESP_LOGD(MONITOR_TASK_TAG, "menuIndex: %d", menuIndex);     // visually shown on LCD, but good as debug. 
             // ESP_LOGD(MONITOR_TASK_TAG, "base_pos: %"PRIu16"", base_pos);    
@@ -1385,7 +1418,7 @@ static void suppress_logs(esp_log_level_t general_level) {
     esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_WARN);  // explicitly suppress this one.
     // make it so that select tasks have higher log levels
     esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_WARN);   // really just needs info level
-    esp_log_level_set(START_TASK_TAG, general_level);
+    // esp_log_level_set(START_TASK_TAG, general_level);    // start task suppressed itself!
     esp_log_level_set(TRANSFER_TAG, general_level);
     esp_log_level_set(MAIN_TAG, general_level);     // in loop, main has no logs!
     esp_log_level_set(UART_MON_TAG, ESP_LOG_INFO);  // should always be on info!
@@ -1424,7 +1457,7 @@ static void core_1_initializer(void* args) {
     my_handlers_t * handles = (my_handlers_t*) args; //malloc(sizeof(my_handlers_t));
     // memset(handles, 0, sizeof(my_handlers_t));  // set to zero
     ESP_LOGI(MAIN_TAG, "Core 1 Initializer. Free heap memory: %"PRIu32"", esp_get_free_heap_size());
-    heap_caps_check_integrity_all(true);
+    // heap_caps_check_integrity_all(true);
     // --- GPTimer / Debounce Timer ---
     #pragma region
     ESP_LOGI(MAIN_TAG, "Initializing GPTimer peripheral for debouncing");
@@ -1480,7 +1513,7 @@ static void core_1_initializer(void* args) {
     #pragma endregion
     // --- SD Card / SDMMC ---
     #pragma region
-    esp_intr_dump(stdout);
+    // esp_intr_dump(stdout);
     ESP_LOGI(MAIN_TAG, "Waiting to initialize SD card (2s). Ensure clock wire is secured.");
     vTaskDelay(2000/portTICK_PERIOD_MS);
 
@@ -1654,14 +1687,14 @@ void app_main(void) {
         ESP_ERROR_CHECK(pcnt_unit_add_watch_point(counter_handle4, count_watchpoints[i]));
     }
     // set up callback, ie interrupt when watchpoint hit
-    pcnt_event_callbacks_t counter_cbs = {
-        .on_reach = on_counter_watch,
-    };
-    QueueHandle_t count_queue = xQueueCreate(20, sizeof(count_event_data));
-    ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(counter_handle1, &counter_cbs, (void*)&count_queue));
-    ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(counter_handle2, &counter_cbs, (void*)&count_queue));
-    ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(counter_handle3, &counter_cbs, (void*)&count_queue));
-    ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(counter_handle4, &counter_cbs, (void*)&count_queue));
+    // pcnt_event_callbacks_t counter_cbs = {
+    //     .on_reach = on_counter_watch,    // callback was causing error
+    // };
+    // QueueHandle_t count_queue = xQueueCreate(20, sizeof(count_event_data));
+    // ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(counter_handle1, &counter_cbs, (void*)&count_queue));
+    // ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(counter_handle2, &counter_cbs, (void*)&count_queue));
+    // ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(counter_handle3, &counter_cbs, (void*)&count_queue));
+    // ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(counter_handle4, &counter_cbs, (void*)&count_queue));
 
     ESP_LOGI(MAIN_TAG, "Enabling Counters");
     ESP_ERROR_CHECK(pcnt_unit_enable(counter_handle1));
@@ -1982,11 +2015,16 @@ void app_main(void) {
     ESP_LOGI(MAIN_TAG, "Writing hello_data to /spiflash/hello.txt; hello_data = %s", hello_data);
     err = write_log_file("/spiflash/hello.txt", hello_data);
     if (err != ESP_OK) {
-        ESP_LOGE(MAIN_TAG, "Error writing test file");
-        return;
+        ESP_LOGW(MAIN_TAG, "Error writing test file. Reformatting");
+        ESP_ERROR_CHECK(esp_vfs_fat_spiflash_format_rw_wl(base_path, "storage"));
+        err = write_log_file("/spiflash/hello.txt", hello_data);
+        if (err != ESP_OK) {
+            ESP_LOGE(MAIN_TAG, "Failed to write second time.");
+            return;
+        }
     }
     // read file back
-    //Open file for reading
+    // Open file for reading
     err = simple_file_read("/spiflash/hello.txt");
     if (err != ESP_OK) {
         return;
@@ -2016,6 +2054,10 @@ void app_main(void) {
     gpio_isr_handler_add(START_BUT, start_isr_handler, (void*)&handles);
     gpio_isr_handler_add(AUX_BUT, aux_isr_handler, (void*)&handles);
     gpio_isr_handler_add(ROTARY_SWITCH, rot_switch_isr_handler, (void*)(handles.gptimer));
+
+    // check where ISR ended up
+    ESP_LOGI(MAIN_TAG, "Dumping interrupts");
+    esp_intr_dump(stdout);
 
     // forgot to initialize this queue
     copy_queue = xQueueCreate(20, sizeof(pulse_data));

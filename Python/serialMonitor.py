@@ -23,9 +23,10 @@ chunk_size: int = 8*1024 * 7    # How much data Python will read at once as a ch
 BEGIN_TAG = b"BEGIN PY READ"    # 'b' is to interpret as binary
 END_TAG = b"END PY READ"        # if the end of a chunk needs to be labeled.
 PY_END_TAG = b"END PY SAMPLE"
+PY_ADC_END_TAG = b"END ADC SAMPLE"
 META_TAG = b"PY METADATA"       # Used to send meta data information
 
-PY_TAG = "Py>\t"    # something to preface python prints to distinuish from MCU data in.
+PY_TAG = "PY>\t"    # something to preface python prints to distinuish from MCU data in.
 
 VMAX = 960  # mV // max when using 0 attenuation
 DMAX = pow(2, 12) # 12-bit resolution
@@ -129,33 +130,42 @@ def read_adc_chunk():
     return adc_raw
 
 #pulse counter reader
-def read_pcnt_data() -> dict[int, array]:
-    print("PY > Reading PCNT Data\n")
+def read_pcnt_data() -> tuple[array, dict[int, array]]:
+    print(PY_TAG, "Reading PCNT Data\n")
     pcnt_data :dict[int, array] = dict()  # stores channel as key, and list (or better, an array) as value (data) (or np array)
-    pcnt_data[0] = array('B')
-    pcnt_data[1] = array('B')
-    pcnt_data[2] = array('B')
-    pcnt_data[3] = array('B')
+    pcnt_data[0] = array('L')      # 4 byte/ 32-bit unsigned integer
+    pcnt_data[1] = array('L')
+    pcnt_data[2] = array('L')
+    pcnt_data[3] = array('L')
 
-    time_data = array('B')
+    time_data = array('Q')  # 64 bit unsigned integer
     # printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read
     line = ser.readline()
-    print("PY > " + str(line.strip(), "utf-8"))
+    print(PY_TAG + str(line.strip(), "utf-8"))
     numLines = line.split(b':')[1].strip()    # gets the last index (should be same as 1) and removes whitespace
+    loops :int = 0
     # Read and Parse each line of data (2 bytes of data, so numBytes/2 gives number of elements to read)
-    for i in range(int(int(numLines, base=10))):  # adjust when >1 channel of data is sent
+    for i in range(int(int(numLines, base=10))):  # adjust when >1 channel of data is sent (there is no adjustment)
         # Each line has time, and 4 ints. Store counts for each channel (known by position). Store time in separate struct
-        line = ser.readline()
-        lineS = line.split(b',')
+        line = ser.readline()   #read line
+        lineS = line.split(b',')    #split line
         try:
-            time_data[i] = int(lineS[0], base=10)
-            pcnt_data[0] = int(lineS[1])
-            pcnt_data[1] = int(lineS[2])
-            pcnt_data[2] = int(lineS[3])
-            pcnt_data[3] = int(lineS[4])
-
+            # put data right into the storage structure
+            time_data[i] = int(lineS[0].strip())    # base-10 default
+            pcnt_data[0][i] = int(lineS[1].strip())
+            pcnt_data[1][i] = int(lineS[2].strip())
+            pcnt_data[2][i] = int(lineS[3].strip())
+            pcnt_data[3][i] = int(lineS[4].strip())
+            print(PY_TAG, str(line, "utf-8"))   # print the line for debugging
         except:
-            print('Error in reading pcnt data')
+            print(PY_TAG, 'Error in reading pcnt data')
+            print(f'{loops=}, line read: \'{line}\'')
+            return -1   # will this cause an error?
+        
+        loops += 1
+    # print end of function and return tuple of data
+    print(PY_TAG, "End of PCNT data read")
+    return (time_data, pcnt_data)
 
     
 # New function to handle user input and display help
@@ -232,12 +242,18 @@ while True:
         print(f'Py > Recieved: {sample_freq=}; {sample_dur=}')
 
     elif dataIn.strip() == BEGIN_TAG:   #if input is the data we want, read it in.
-        # adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values   
-        adc_data_partial = read_adc_data()  # read line by line, use delay on MCU time
+        # adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values  
+        # #TODO: update names of variables! 
+        adc_data_partial = read_pcnt_data()  # read line by line, use delay on MCU time
         loopCompletions += 1
         adc_data.append(adc_data_partial)
 
     elif dataIn.strip() == PY_END_TAG:
+        # export data to file
+        print(PY_TAG, "Sample end not implemented")
+        pass
+
+    elif dataIn.strip() == PY_ADC_END_TAG:
         # export the list of dictionaries into one large dictionary (of chNum->array of data)
         # other way to store data: 2D array of chNum and time or cycles. 
         big_data = adc_data[0]  #should be a dictionary  
