@@ -133,40 +133,94 @@ def read_adc_chunk():
 def read_pcnt_data() -> tuple[array, dict[int, array]]:
     print(PY_TAG, "Reading PCNT Data\n")
     pcnt_data :dict[int, array] = dict()  # stores channel as key, and list (or better, an array) as value (data) (or np array)
-    pcnt_data[0] = array('L')      # 4 byte/ 32-bit unsigned integer
-    pcnt_data[1] = array('L')
-    pcnt_data[2] = array('L')
-    pcnt_data[3] = array('L')
+    pcnt_data[0] = array('l')      # 4 byte/ 32-bit integer
+    pcnt_data[1] = array('l')       # 'L' for unsigned, 'l' for signed
+    pcnt_data[2] = array('l')
+    pcnt_data[3] = array('l')
 
     time_data = array('Q')  # 64 bit unsigned integer
     # printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read
     line = ser.readline()
-    print(PY_TAG + str(line.strip(), "utf-8"))
-    numLines = line.split(b':')[1].strip()    # gets the last index (should be same as 1) and removes whitespace
-    loops :int = 0
-    # Read and Parse each line of data (2 bytes of data, so numBytes/2 gives number of elements to read)
-    for i in range(int(int(numLines, base=10))):  # adjust when >1 channel of data is sent (there is no adjustment)
-        # Each line has time, and 4 ints. Store counts for each channel (known by position). Store time in separate struct
-        line = ser.readline()   #read line
-        lineS = line.split(b',')    #split line
+    print(PY_TAG, str(line.strip(), "utf-8"))
+    iters = line.split(b':')[1].strip()
+
+    for j in range(int(iters, base=10)):
+        # Ensure nothing prints in between! (suppress all the logs!)
         try:
-            # put data right into the storage structure
-            time_data[i] = int(lineS[0].strip())    # base-10 default
-            pcnt_data[0][i] = int(lineS[1].strip())
-            pcnt_data[1][i] = int(lineS[2].strip())
-            pcnt_data[2][i] = int(lineS[3].strip())
-            pcnt_data[3][i] = int(lineS[4].strip())
-            print(PY_TAG, str(line, "utf-8"))   # print the line for debugging
-        except:
-            print(PY_TAG, 'Error in reading pcnt data')
-            print(f'{loops=}, line read: \'{line}\'')
-            return -1   # will this cause an error?
-        
-        loops += 1
+            line = ser.readline()
+            print(PY_TAG, str(line.strip(), "utf-8"))
+            numLines = line.split(b':')[1].strip()    # gets the last index (should be same as 1) and removes whitespace
+        except Exception as err:
+            print(PY_TAG, "Error getting number of lines! Error: ", str(err))
+            print(f'{str(line,"utf-8")=}')
+        loops :int = 0
+        # Read and Parse each line of data (2 bytes of data, so numBytes/2 gives number of elements to read)
+        for i in range(int(int(numLines, base=10))):  # adjust when >1 channel of data is sent (there is no adjustment)
+            # Each line has time, and 4 ints. Store counts for each channel (known by position). Store time in separate struct
+            line = ser.readline()   #read line
+            lineS = line.split(b',')    #split line
+            try:
+                # put data right into the storage structure
+                time_data.append(int(lineS[0].strip()))    # base-10 default
+                pcnt_data[0].append(int(lineS[1].strip()))
+                pcnt_data[1].append(int(lineS[2].strip()))
+                pcnt_data[2].append(int(lineS[3].strip()))
+                pcnt_data[3].append(int(lineS[4].strip()))
+                print(PY_TAG, str(line, "utf-8"), end='')   # print the line for debugging
+            except:
+                print(PY_TAG, 'Error in reading pcnt data')
+                print(f'{loops=}, line read: \'{line}\'')
+                return (time_data, pcnt_data)
+                # return -1   # will this cause an error?
+            
+            loops += 1
     # print end of function and return tuple of data
     print(PY_TAG, "End of PCNT data read")
     return (time_data, pcnt_data)
 
+def plot_pcnt_data(time_data: array, pcnt_data: dict[int, array], sample_frequency: int):
+    """
+    Plots pulse counts over time for four channels.
+
+    Args:
+        time_data (array): Array of time intervals in 0.1 ms.
+        pcnt_data (dict[int, array]): Dictionary containing pulse counts for four channels.
+        sample_frequency (int): Sample frequency in Hz.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Convert time_data from microseconds to seconds
+    time_in_seconds = np.array(time_data) * 1e-4
+
+    # Calculate sample period
+    sample_period = 1 / sample_frequency  # In seconds
+
+    # Calculate pulse differences for each channel, including the first point
+    channel_pulse_diffs = {}
+    for ch in range(4):
+        channel_data = np.array(pcnt_data[ch])
+        pulse_diffs = np.zeros_like(channel_data)
+        pulse_diffs[0] = channel_data[0]  # Keep the first data point as-is
+        pulse_diffs[1:] = np.diff(channel_data)  # Compute differences from the second point onward
+        channel_pulse_diffs[ch] = pulse_diffs
+
+    # Plot data for each channel
+    plt.figure(figsize=(10, 6))
+    for ch in range(4):
+        plt.plot(
+            time_in_seconds,  # Use all time points, including the first
+            channel_pulse_diffs[ch],
+            label=f"Channel {ch}",
+            linewidth=1.5
+        )
+
+    plt.title(f"Pulse Counts Over Time (Sample Frequency: {sample_frequency} Hz)")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Pulse Count")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
     
 # New function to handle user input and display help
 def send_user_commands():
@@ -239,14 +293,38 @@ while True:
         line = dataIn.strip().split(b';')
         sample_freq = int(line[0].split(b':')[1], base=10) # Hz 
         sample_dur = int(line[1].split(b':')[1], base=10)  # ms  
-        print(f'Py > Recieved: {sample_freq=}; {sample_dur=}')
+        print(f'PY > Recieved: {sample_freq=}; {sample_dur=}')
 
     elif dataIn.strip() == BEGIN_TAG:   #if input is the data we want, read it in.
         # adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values  
         # #TODO: update names of variables! 
-        adc_data_partial = read_pcnt_data()  # read line by line, use delay on MCU time
-        loopCompletions += 1
-        adc_data.append(adc_data_partial)
+        pcnt_data = read_pcnt_data()  # read line by line, use delay on MCU time
+        # for now, plot data here
+        plot_pcnt_data(pcnt_data[0], pcnt_data[1], sample_freq) # potentially put in separate thread so monitoring can continue
+        # export data to a file
+        # save data for later use.
+        curTime = time.localtime()
+        # YYYYDDMM_hhmmss
+        timeStr = str(curTime.tm_year) + str(curTime.tm_mday) + str(curTime.tm_mon)+'_'+ str(curTime.tm_hour)+str(curTime.tm_min)+str(curTime.tm_sec)
+        for ch in pcnt_data[1]:
+            fileName = DEFAULT_DIR + 'pcntCH' + str(ch) + '_' + timeStr + '.txt'
+            with open(fileName, 'w') as fd:
+                fd.write("Saved PCNT Data for CH" + str(ch) + " on " + timeStr + '\n')
+                #additional meta data if need be. Use lines as separators.
+                fd.write("PCNT Channel: " + str(ch) + "\n")
+                fd.write("Time: " + timeStr + "\n")
+                fd.write("Sample Frequency: " + str(sample_freq) + "\n")
+                fd.write("Sample Duration: " + str(sample_dur) + "\n")
+                # number of elements would help!    - if can't get right value from below, take it from ESP32 log. 
+                fd.write("Time array Size: " + str(len(pcnt_data[0])) + '\n')
+                
+                fd.write(str(pcnt_data[0]))  #may or may not work
+                fd.write('\n' + "Pulse count array size:" + str(len(pcnt_data[1][ch])) + '\n')
+                fd.write(str(pcnt_data[1][ch]))
+                # alternatively, array can be saved to a binary file with .tofile(fd), and then read using .fromfile(fd, # to read)
+                print("PY > file created: ", fileName)
+        # loopCompletions += 1
+        # adc_data.append(adc_data_partial)
 
     elif dataIn.strip() == PY_END_TAG:
         # export data to file
@@ -276,7 +354,7 @@ while True:
                 fd.write("Sample Duration: " + str(sample_dur) + "\n")
                 # number of elements would help!    - if can't get right value from below, take it from ESP32 log. 
                 fd.write("Array Size: " + str(len(big_data[ch])) + '\n')
-
+                
                 fd.write(str(big_data[ch]))  #may or may not work
                 # alternatively, array can be saved to a binary file with .tofile(fd), and then read using .fromfile(fd, # to read)
                 print("PY > file created: ", fileName)

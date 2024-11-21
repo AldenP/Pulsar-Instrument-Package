@@ -694,6 +694,7 @@ static void sample_start_task(void* args) {
             ESP_LOGE(START_TASK_TAG, "NVS get error, aborting ADC conversion");
             continue;
         }
+        
         ret = get_nvs_uint(SAMPLE_START_NVS, &sample_start_sector);
         if (ret == ESP_ERR_NVS_NOT_FOUND) {
             ESP_LOGW(START_TASK_TAG, "Setting sample_starting_sector to default");
@@ -708,8 +709,9 @@ static void sample_start_task(void* args) {
         // --- anything else?
         
         suppress_logs(ESP_LOG_INFO);    // suppress the logs!
-        esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_DEBUG);
-        
+        // esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_DEBUG);
+        // esp_log_level_set(TRANSFER_TAG, ESP_LOG_DEBUG);
+
         ESP_LOGI(START_TASK_TAG, "Clearing PCNT counts...");
         pcnt_unit_clear_count(counter_handle1);
         pcnt_unit_clear_count(counter_handle2);
@@ -745,8 +747,15 @@ static void sample_start_task(void* args) {
         ESP_ERROR_CHECK(gptimer_enable(duration_timer));
         ESP_ERROR_CHECK(gptimer_enable(segment_timer));
 
-        // TODO: send Waveplate commands
-        ESP_LOGI(START_TASK_TAG, "Sending waveplate commands");
+        // TODO: send Waveplate commands. configured in main, so just go HOME then BW
+        ESP_LOGI(START_TASK_TAG, "Starting waveplate rotation");
+        send_waveplate_command("ho", 0, 1); // home
+        vTaskDelay(10/portTICK_PERIOD_MS);
+        read_waveplate_response();
+
+        send_waveplate_command("bw", 0,0);  // rotate backwards (CCW)
+        vTaskDelay(10/portTICK_PERIOD_MS);
+        read_waveplate_response();
 
         uint64_t tic = esp_cpu_get_cycle_count();
         // Start pulse counters
@@ -783,7 +792,7 @@ static void sample_start_task(void* args) {
 
         sample_state = false;
         ESP_LOGI(START_TASK_TAG, "Sampling finished.");
-        xTaskNotifyGive(copy_sample_handle);    // notify copy that sample is over
+        // xTaskNotifyGive(copy_sample_handle);    // notify copy that sample is over
         vTaskSuspend(NULL);    // wait until copy finished
 
         // After re-awakening, disable timers so they can be adjusted later
@@ -840,12 +849,13 @@ static void sample_start_task(void* args) {
         }
         ESP_LOGD(START_TASK_TAG, "Sample variables saved to NVS successfully");
         #pragma endregion
-        ESP_LOGI(START_TASK_TAG, "Delaying transfer task to read logs (10s)");
-        // vTaskDelay(10000/portTICK_PERIOD_MS);
+        
+        ESP_LOGI(START_TASK_TAG, "Delaying transfer task to read logs (5s)");
+        vTaskDelay(5000/portTICK_PERIOD_MS);
 
         // inform/start transfer task
-        // xTaskNotifyGive(sample_transfer_task_handle);
-        // vTaskSuspend(NULL); // transfer task will resume!
+        xTaskNotifyGive(sample_transfer_task_handle);
+        vTaskSuspend(NULL); // transfer task will resume!
 
         unsuppress_logs(ESP_LOG_DEBUG);    // un-suppress the logs!
         // restore logs if not suppressed.
@@ -853,9 +863,7 @@ static void sample_start_task(void* args) {
             ESP_LOGI(START_TASK_TAG, "Resuming monitor logging");
             esp_log_level_set(MONITOR_TASK_TAG, ESP_LOG_DEBUG);
         }
-        
     }
-
 }
 /**
  * Task to handle data from timer ISR. Performs:
@@ -936,8 +944,9 @@ static void sample_copy_task(void* args) {
             // after one second, check if sampling has stopped to write rest of the buffer to SD card
             // needs to be coordinated with other tasks, use notification instead
             // export current buffer size to SD card
-            size_t num_sectors = (buf_idx+1)*sizeof(pulse_data) / 512; // sector size is 512 B. 
+            size_t num_sectors = ((buf_idx+1)*sizeof(pulse_data) +511) / 512; // round data up to next sector. 
             if (num_sectors < 1) {
+                ESP_LOGD(SAMPLE_COPY_TAG, "setting num_sectors to 1 (too small)");
                 num_sectors = 1;
             }
             ESP_ERROR_CHECK(sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors));
@@ -950,7 +959,7 @@ static void sample_copy_task(void* args) {
         //     // store q_receive into buffer
         //     if (buf_idx < PULSE_DATA_BUF_LEN) { /* if buffer has room */
         //         buffer[buf_idx++] = q_receive;  // increment index after statement executes!
-
+        //
         //     } else {    // BUG: only runs if we sample long enough to fill a buffer!
         //         // write buffer to SD card and hope it is fast enough!
         //         // use sample_start_sector to write buffer to SD card via raw access
@@ -969,7 +978,7 @@ static void sample_copy_task(void* args) {
         //         size_t num_sectors = buf_idx*sizeof(pulse_data) / 512; // sector size is 512 B. 
         //         sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors);
         //         sample_sector += num_sectors; //update sector start for next buffer (global variable)
-
+        //
         //         xTaskNotifyGive(start_task_handle);
         //     } // else just continue back to queue
         // }
@@ -1012,7 +1021,7 @@ static void sample_transfer_task(void* args) {
         ret = read_line_file(log_fp, data_buf, 256);
         // check ret val?
         ESP_LOGD(TRANSFER_TAG, "1st line read from log file: '%s'", data_buf);
-        uint32_t d_num, d_start, s_freq, s_dur; // vars to read data into. 
+        uint32_t d_num, sample_start, s_freq, s_dur; // vars to read data into. 
         sscanf(data_buf, "%*s %lu", &d_num);  // %*s will read a string and discard. the ':' will be read and compared, if matches, continues.
         
         if (d_num != sample_num -1) /* Sanity check */ {
@@ -1024,7 +1033,7 @@ static void sample_transfer_task(void* args) {
             continue;
         }
         ret = read_line_file(log_fp, data_buf, 256);
-        sscanf(data_buf, "%*s %lu", &d_start);    // gets starting sector address
+        sscanf(data_buf, "%*s %lu", &sample_start);    // gets starting sector address
         
         ret = read_line_file(log_fp, data_buf, 256);
         sscanf(data_buf, "%*s %lu", &num_sectors);  // gets number of sectors to read
@@ -1037,7 +1046,7 @@ static void sample_transfer_task(void* args) {
         fclose(log_fp); // not super critical for reading only, but good practice.
 
         ESP_LOGD(TRANSFER_TAG, "Metadata from file: Sample #%lu, start: %lu, size: %lu, freq: %lu, dur: %lu", 
-                                                            d_num, d_start, num_sectors, s_freq, s_dur);// log debug information
+                                                            d_num, sample_start, num_sectors, s_freq, s_dur);// log debug information
         
         // Now we can read over the sectors, printing each of them to the terminal, with some delay between them to help Python out.
         pulse_data * tmp_buf = (pulse_data*) calloc(PULSE_DATA_BUF_LEN, sizeof(pulse_data));
@@ -1051,66 +1060,123 @@ static void sample_transfer_task(void* args) {
         // Send sample metadata to python
         printf("%s\nfreq: %"PRIu32"; duration: %"PRIu32"\n", PY_DATA, sample_frequency, sample_duration);
                 
-        uint32_t tmp_start = d_start;
+        uint32_t read_sector = sample_start;
         // prepare to loop over a set number of sectors
         // total sectors / number of sectors per buffer *full*
         // size_t step_sectors = num_sectors / (PULSE_DATA_BUF_LEN/512);   // ISSUE: last buffer might not be full! 
-        size_t step_sectors = PULSE_DATA_BUF_LEN / 512;
+        // size_t step_sectors = PULSE_DATA_BUF_LEN / 512;
         // Logical Bug: step_sectors should be DATA_BUF_LEN / 512 (6), and total number of iterations = num_sectors/6
-        if (step_sectors == 0) {
-            ESP_LOGE(TRANSFER_TAG, "step_sectors is zero! Breaking loop");
-            free(tmp_buf);
-            break;
-        }
-        size_t last_set = num_sectors % (PULSE_DATA_BUF_LEN/512);   // gives the number of sectors that were written at end of copy task
-        // tell python number of loops, and how much per loop? 
-        for (size_t transferred = 0; transferred < num_sectors; transferred += step_sectors) {
-            // read from d_start into the tmp_buf  
-            ret = sdmmc_read_sectors(card, tmp_buf, d_start, step_sectors);
+        // if (step_sectors == 0) {
+        //     ESP_LOGE(TRANSFER_TAG, "step_sectors is zero! Breaking loop");
+        //     free(tmp_buf);
+        //     break;
+        // }
+        // size_t last_set = num_sectors % (PULSE_DATA_BUF_LEN/512);   // gives the number of sectors that were written at end of copy task
+
+        size_t sectors_to_read = num_sectors;
+        size_t buffer_sector_size = PULSE_DATA_BUF_LEN / 512;
+
+        // determine the number of loop iterations (to get data in 1 function in Python)
+        size_t iterations = num_sectors / buffer_sector_size + 1;
+        // send to Python
+        printf("%s\nIterations: %u\n", PY_TAG, iterations);
+
+        while (sectors_to_read >= buffer_sector_size) {
+            // read 6 sectors (a full buffers worth)
+            ret = sdmmc_read_sectors(card, tmp_buf, read_sector, buffer_sector_size);
             if (ret != ESP_OK) {
-                ESP_LOGE(TRANSFER_TAG, "Error reading SD card sectors for addr: %lu, and size: %u", d_start, step_sectors);
+                ESP_LOGE(TRANSFER_TAG, "Error reading SD card sectors for addr: %lu, and size: %u", sample_start, buffer_sector_size);
                 free(tmp_buf);
-                break;  // breaks this for loop only.
+                break;  // breaks this loop only.
             }
-            printf("%s\nNum Lines: %u\n", PY_TAG, PULSE_DATA_BUF_LEN);
-            // print data to terminal
-            for (size_t i = 0; i < PULSE_DATA_BUF_LEN; i++) {
+            // Find number of lines to read (how many pulse_data structures are in one buffer)
+            size_t numLines = PULSE_DATA_BUF_LEN / sizeof(pulse_data);  //6*512/24 = 128
+            printf("Num Lines: %u\n", numLines);  // inform Python!
+            // print the data out. 
+            for (size_t i = 0; i < numLines; i++) {
                 // format as timer count, then sensors 1-4
                 printf("%6llu, %ld, %ld, %ld, %ld\n", tmp_buf[i].timer_count, tmp_buf[i].counts[0],tmp_buf[i].counts[1],
                             tmp_buf[i].counts[2], tmp_buf[i].counts[3]);
             }
 
-            d_start += step_sectors;    // update address to read from next
+            // update loop iterators
+            read_sector += buffer_sector_size;
+            sectors_to_read -= buffer_sector_size;
             vTaskDelay(10/portTICK_PERIOD_MS);  // give python 10ms to catchup
         }
-        // handle the leftovers, if any
-        if (last_set != 0) {
-            ret = sdmmc_read_sectors(card, tmp_buf, d_start, last_set);
+        if (sectors_to_read > 0) {
+            // read the remaining sectors
+            ret = sdmmc_read_sectors(card, tmp_buf, read_sector, sectors_to_read);
             if (ret != ESP_OK) {
-                ESP_LOGE(TRANSFER_TAG, "Error reading SD card sectors for addr: %lu, and size: %u", d_start, step_sectors);
+                ESP_LOGE(TRANSFER_TAG, "Error reading SD card sectors for addr: %lu, and size: %u", sample_start, buffer_sector_size);
                 free(tmp_buf);
-                continue;
+                break;  // breaks this loop only.
             }
-            size_t lines = last_set*512/sizeof(pulse_data); // I believe that to be the correct # of lines
-            ESP_LOGD(TRANSFER_TAG, "Last set of data (lines: %u)", lines);
-            printf("%s\nNum Lines: %u\n", PY_TAG, lines);  
-            // print data to terminal
-            for (size_t i = 0; i < lines; i++) {
+            // Find number of lines to read (how many `pulse_data` structs have been read)
+            size_t numLines = sectors_to_read*512 / sizeof(pulse_data);
+            printf("Num Lines: %u\n", numLines);  // inform Python!
+            // print the data out. 
+            for (size_t i = 0; i < numLines; i++) {
                 // format as timer count, then sensors 1-4
                 printf("%6llu, %ld, %ld, %ld, %ld\n", tmp_buf[i].timer_count, tmp_buf[i].counts[0],tmp_buf[i].counts[1],
                             tmp_buf[i].counts[2], tmp_buf[i].counts[3]);
             }
-            d_start += last_set;    // update address for a sanity check
+
+            // update loop iterators
+            read_sector += sectors_to_read;
+            // sectors_to_read -= sectors_to_read;  // unnecessary, not in loop
+            vTaskDelay(10/portTICK_PERIOD_MS);  // give python 10ms to catchup
         }
+
+        // tell python number of loops, and how much per loop? 
+        // for (size_t transferred = 0; transferred < num_sectors; transferred += step_sectors) {
+        //     // read from d_start into the tmp_buf  
+        //     ret = sdmmc_read_sectors(card, tmp_buf, d_start, step_sectors);
+        //     if (ret != ESP_OK) {
+        //         ESP_LOGE(TRANSFER_TAG, "Error reading SD card sectors for addr: %lu, and size: %u", d_start, step_sectors);
+        //         free(tmp_buf);
+        //         break;  // breaks this for loop only.
+        //     }
+        //     printf("%s\nNum Lines: %u\n", PY_TAG, PULSE_DATA_BUF_LEN);
+        //     // print data to terminal
+        //     for (size_t i = 0; i < PULSE_DATA_BUF_LEN; i++) {
+        //         // format as timer count, then sensors 1-4
+        //         printf("%6llu, %ld, %ld, %ld, %ld\n", tmp_buf[i].timer_count, tmp_buf[i].counts[0],tmp_buf[i].counts[1],
+        //                     tmp_buf[i].counts[2], tmp_buf[i].counts[3]);
+        //     }
+        //
+        //     d_start += step_sectors;    // update address to read from next
+        //     vTaskDelay(10/portTICK_PERIOD_MS);  // give python 10ms to catchup
+        // }
+        // // handle the leftovers, if any
+        // if (last_set != 0) {
+        //     ret = sdmmc_read_sectors(card, tmp_buf, d_start, last_set);
+        //     if (ret != ESP_OK) {
+        //         ESP_LOGE(TRANSFER_TAG, "Error reading SD card sectors for addr: %lu, and size: %u", d_start, step_sectors);
+        //         free(tmp_buf);
+        //         continue;
+        //     }
+        //     size_t lines = last_set*512/sizeof(pulse_data); // I believe that to be the correct # of lines
+        //     ESP_LOGD(TRANSFER_TAG, "Last set of data (lines: %u)", lines);
+        //     printf("%s\nNum Lines: %u\n", PY_TAG, lines);  
+        //     // print data to terminal
+        //     for (size_t i = 0; i < lines; i++) {
+        //         // format as timer count, then sensors 1-4
+        //         printf("%6llu, %ld, %ld, %ld, %ld\n", tmp_buf[i].timer_count, tmp_buf[i].counts[0],tmp_buf[i].counts[1],
+        //                     tmp_buf[i].counts[2], tmp_buf[i].counts[3]);
+        //     }
+        //     d_start += last_set;    // update address for a sanity check
+        // }
+        
         // sanity check if data read matches expected amount.
-        if (d_start != num_sectors+tmp_start+last_set) {
+        if (read_sector != sample_start+num_sectors) {
             ESP_LOGE(TRANSFER_TAG, "Sanity Check failed! Ending sector doesn't match expected");
-            ESP_LOGE(TRANSFER_TAG, "Start Sector: %lu, Num Sectors: %lu, Last Set: %u, End Sector: %lu", tmp_start, num_sectors, last_set, d_start);
+            ESP_LOGE(TRANSFER_TAG, "Start Sector: %lu, Num Sectors: %lu, End Sector: %lu", read_sector, num_sectors, sample_start);
             // free(tmp_buf);
             // continue;
         }
         // done reading data
-        free(tmp_buf);
+        free(tmp_buf);  // release buffer, not needed until next time.
         vTaskResume(start_task_handle);
     }
 }
