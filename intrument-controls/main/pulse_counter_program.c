@@ -197,6 +197,7 @@ static const char *servoStatus[] = {"OFF", " ON"};  //default is off, turn on wi
 uint32_t sample_frequency = DEFAULT_SAMPLE_FREQ;    // default 1MHz frequency
 uint32_t sample_duration = 250;         // default 250ms 
 volatile uint32_t bytes_read = 0;   // no longer changes in ISR context, removed volatile. except volatile is used more than just from ISRs
+volatile size_t end_sample_buf_idx = 0;
 
 // Queue Handle for copy task
 QueueHandle_t copy_queue = NULL;
@@ -210,6 +211,7 @@ static pcnt_unit_handle_t counter_handle4 = NULL;
 // Timer handles - I think static is okay for these
 static gptimer_handle_t segment_timer = NULL;
 static gptimer_handle_t duration_timer = NULL;
+static gptimer_handle_t debounce_timer = NULL;
 
 // NVS Global handle
 static nvs_handle_t my_nvs_handle;
@@ -512,10 +514,10 @@ static void IRAM_ATTR start_isr_handler(void* arg) {
     my_handlers_t *handles = (my_handlers_t*) arg;
     // adc_continuous_handle_t *adc_handle = handles->adc_handle;
     // debounce scheme first.
-    gptimer_handle_t *t_handle = handles->gptimer;
+    // gptimer_handle_t *t_handle = handles->gptimer;
     gpio_intr_disable(START_BUT);   // logical error: had wrong GPIO tag
     // gptimer_set_raw_count(*t_handle, 0);
-    gptimer_start(*t_handle);
+    gptimer_start(debounce_timer);
 
     // provide visual output of pressing button.
     led_state = !led_state;
@@ -535,10 +537,10 @@ static void IRAM_ATTR aux_isr_handler(void* arg) {
     if (gpio_get_level(AUX_BUT) == 1) {
         return;
     }   // else continue to debounce
-    gptimer_handle_t *t_handle = ((my_handlers_t*)arg)->gptimer;
+    // gptimer_handle_t *t_handle = ((my_handlers_t*)arg)->gptimer;
     gpio_intr_disable(AUX_BUT); // also had logical error (had ROTARY_SWITCH instead)
     // gptimer_set_raw_count(*t_handle, 0);
-    gptimer_start(*t_handle);
+    gptimer_start(debounce_timer);
     // provide visual output of button press
     led_state = !led_state;
     gpio_set_level(GREEN_LED, led_state);   // to be ISR/IRAM safe, check config editor under GPIO.
@@ -561,10 +563,10 @@ static void IRAM_ATTR rot_switch_isr_handler(void* args) {
     led_state = !led_state; 
     gpio_set_level(GREEN_LED, led_state);   // visually indicated button push registered
     // debounce scheme first. (seems to need a long timer. )
-    gptimer_handle_t *t_handle = (gptimer_handle_t*) args;  //get timer handle from args
+    // gptimer_handle_t *t_handle = (gptimer_handle_t*) args;  //get timer handle from args
     gpio_intr_disable(ROTARY_SWITCH);   // prevent other interrupts
     // gptimer_set_raw_count(*t_handle, 0);
-    gptimer_start(*t_handle);
+    gptimer_start(debounce_timer);
     
     // now update position
     // if on pupil imaging menu, pressing dial will change it's state
@@ -710,7 +712,7 @@ static void sample_start_task(void* args) {
         
         suppress_logs(ESP_LOG_INFO);    // suppress the logs!
         // esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_DEBUG);
-        // esp_log_level_set(TRANSFER_TAG, ESP_LOG_DEBUG);
+        esp_log_level_set(TRANSFER_TAG, ESP_LOG_DEBUG);
 
         ESP_LOGI(START_TASK_TAG, "Clearing PCNT counts...");
         pcnt_unit_clear_count(counter_handle1);
@@ -767,6 +769,9 @@ static void sample_start_task(void* args) {
 
         // Start sampling (start timers)
         sample_state = true;
+        red_led_state = true;
+        gpio_set_level(RED_LED, red_led_state);
+
         ret = gptimer_start(segment_timer);
         if (ret != ESP_OK) {
             ESP_LOGE(START_TASK_TAG, "Error starting segment timer! (%s)", esp_err_to_name(ret));
@@ -791,6 +796,8 @@ static void sample_start_task(void* args) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);    // wait for duration timer to awaken this task!
 
         sample_state = false;
+        red_led_state = false;
+        gpio_set_level(RED_LED, red_led_state);
         ESP_LOGI(START_TASK_TAG, "Sampling finished.");
         // xTaskNotifyGive(copy_sample_handle);    // notify copy that sample is over
         vTaskSuspend(NULL);    // wait until copy finished
@@ -815,9 +822,9 @@ static void sample_start_task(void* args) {
         #pragma region 
         uint32_t num_sectors = sample_sector - sample_start_sector;
         snprintf(log_file, 128, "%s/samp%03lu.txt", base_path, sample_num);
-        snprintf(temp_data, 256, "sample_num: %lu\nstart_sector: %lu\nnum_sectors: %lu\nsample_freq: %lu\nsample_duration: %lu\n",
+        snprintf(temp_data, 256, "sample_num: %lu\nstart_sector: %lu\nnum_sectors: %lu\nstop index: %u\nsample_freq: %lu\nsample_duration: %lu\n",
                 sample_num, sample_start_sector, num_sectors, /* end - start = total sectors written */
-                sample_frequency, sample_duration);     // now includes the frequency and duration. Important metadata!
+                end_sample_buf_idx, sample_frequency, sample_duration);     // now includes the frequency and duration. Important metadata!
         
         ESP_LOGD(START_TASK_TAG, "log_file: %s\ntemp_data:\n%s", log_file, temp_data);     // log debug information
         // if (num_sectors*512 != bytes_read) {
@@ -944,14 +951,17 @@ static void sample_copy_task(void* args) {
             // after one second, check if sampling has stopped to write rest of the buffer to SD card
             // needs to be coordinated with other tasks, use notification instead
             // export current buffer size to SD card
-            size_t num_sectors = ((buf_idx+1)*sizeof(pulse_data) +511) / 512; // round data up to next sector. 
+
+            // buf_idx is incremented after data is written to that index. Thus, no need to add one here. (buf_idx = 0 means no extra data)
+            size_t num_sectors = ((buf_idx)*sizeof(pulse_data) +511) / 512; // round data up to next sector. 
             if (num_sectors < 1) {
                 ESP_LOGD(SAMPLE_COPY_TAG, "setting num_sectors to 1 (too small)");
                 num_sectors = 1;
             }
             ESP_ERROR_CHECK(sdmmc_write_sectors(handles->card, buffer, sample_sector, num_sectors));
             sample_sector += num_sectors; //update sector start for next buffer (global variable)
-            
+            end_sample_buf_idx = buf_idx;   // store the ending buffer index to terminate output later to prevent garbage being sent to python.
+
             buf_idx = 0;    // reset index for next time
             vTaskResume(start_task_handle);
         }
@@ -1017,11 +1027,11 @@ static void sample_transfer_task(void* args) {
             vTaskResume(start_task_handle);   // don't forget to do this!
             continue;
         }   // else the file was openned successfully!
-        // Data written: "sample_num:%lu\nstart_sector:%lu\nnum_sectors:%lu\nsample_freq:%lu\nsample_duration:%lu\n"
+        // Data written: "sample_num: %lu\nstart_sector: %lu\nnum_sectors: %lu\nstop index: %u\nsample_freq: %lu\nsample_duration: %lu\n"
         ret = read_line_file(log_fp, data_buf, 256);
         // check ret val?
         ESP_LOGD(TRANSFER_TAG, "1st line read from log file: '%s'", data_buf);
-        uint32_t d_num, sample_start, s_freq, s_dur; // vars to read data into. 
+        uint32_t d_num, sample_start, end_idx, s_freq, s_dur; // vars to read data into. 
         sscanf(data_buf, "%*s %lu", &d_num);  // %*s will read a string and discard. the ':' will be read and compared, if matches, continues.
         
         if (d_num != sample_num -1) /* Sanity check */ {
@@ -1039,15 +1049,22 @@ static void sample_transfer_task(void* args) {
         sscanf(data_buf, "%*s %lu", &num_sectors);  // gets number of sectors to read
 
         ret = read_line_file(log_fp, data_buf, 256);
+        sscanf(data_buf, "%*s %lu", &end_idx);      // gets the ending index of the buffers
+
+        ret = read_line_file(log_fp, data_buf, 256);
         sscanf(data_buf, "%*s %lu", &s_freq);       // sample frequency
 
         ret = read_line_file(log_fp, data_buf, 256);
         sscanf(data_buf, "%*s %lu", &s_dur);        //sample duration
         fclose(log_fp); // not super critical for reading only, but good practice.
 
-        ESP_LOGD(TRANSFER_TAG, "Metadata from file: Sample #%lu, start: %lu, size: %lu, freq: %lu, dur: %lu", 
-                                                            d_num, sample_start, num_sectors, s_freq, s_dur);// log debug information
-        
+        // log debug information
+        ESP_LOGD(TRANSFER_TAG, "Metadata from file: Sample #%lu, start: %lu, size: %lu, end idx: %lu, freq: %lu, dur: %lu", 
+                                                            d_num, sample_start, num_sectors, end_idx, s_freq, s_dur);
+        if (end_idx < 0) {
+            ESP_LOGW(TRANSFER_TAG, "Ending index less than zero, setting to zero");
+            end_idx = 0;
+        }
         // Now we can read over the sectors, printing each of them to the terminal, with some delay between them to help Python out.
         pulse_data * tmp_buf = (pulse_data*) calloc(PULSE_DATA_BUF_LEN, sizeof(pulse_data));
         if (tmp_buf == NULL) {
@@ -1076,7 +1093,7 @@ static void sample_transfer_task(void* args) {
         size_t sectors_to_read = num_sectors;
         size_t buffer_sector_size = PULSE_DATA_BUF_LEN / 512;
 
-        // determine the number of loop iterations (to get data in 1 function in Python)
+        // determine the number of loop iterations (to get data in a single function within Python)
         size_t iterations = num_sectors / buffer_sector_size + 1;
         // send to Python
         printf("%s\nIterations: %u\n", PY_TAG, iterations);
@@ -1113,7 +1130,8 @@ static void sample_transfer_task(void* args) {
                 break;  // breaks this loop only.
             }
             // Find number of lines to read (how many `pulse_data` structs have been read)
-            size_t numLines = sectors_to_read*512 / sizeof(pulse_data);
+            // size_t numLines = sectors_to_read*512 / sizeof(pulse_data);
+            size_t numLines = end_idx;
             printf("Num Lines: %u\n", numLines);  // inform Python!
             // print the data out. 
             for (size_t i = 0; i < numLines; i++) {
@@ -1440,7 +1458,25 @@ static void handle_command(const char* command, void* args) {
             }   // otherwise, integer read sucessfully
 
             ESP_LOGI(UART_MON_TAG, "Command read correctly, sample_duration = %"PRIu32"", sample_duration);
-/*else*/} else {
+/*else*/} /* else if (token != NULL && strcmp(token, "get") == 0) {
+            // set global sample number, and then 
+            token = strtok(NULL, " ");
+            if (token == NULL) {
+                ESP_LOGW(UART_MON_TAG, "Invalid argument for \"get\" command. Usage: \"get <sample number>\"");
+                return;
+            }
+            int desired_number = 0, max_num = 0, prev = sample_num;
+            int ret = sscanf(token, "%d", &desired_number);
+            ESP_ERROR_CHECK(get_nvs_uint(SAMPLE_NUM_NVS, &max_num));
+            if (ret < 1 || desired_number < 0 || desired_number >= max_num) {
+                ESP_LOGE(UART_MON_TAG, "Invalid sample number for \"get\" command (%s). Max is %lu.", token, max_num);
+                return;
+            }
+            sample_num = desired_number +1;
+            xTaskNotifyGive(sample_transfer_task);
+            // how to wait for it to finish?
+            sample_num = prev; 
+        } */ else {
             ESP_LOGW(UART_MON_TAG, "Unknown command received: \"%s\"", command);
         }
     }
@@ -1485,7 +1521,7 @@ static void suppress_logs(esp_log_level_t general_level) {
     // make it so that select tasks have higher log levels
     esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_WARN);   // really just needs info level
     // esp_log_level_set(START_TASK_TAG, general_level);    // start task suppressed itself!
-    esp_log_level_set(TRANSFER_TAG, general_level);
+    // esp_log_level_set(TRANSFER_TAG, general_level);
     esp_log_level_set(MAIN_TAG, general_level);     // in loop, main has no logs!
     esp_log_level_set(UART_MON_TAG, ESP_LOG_INFO);  // should always be on info!
     esp_log_level_set(SERVO_TASK_TAG, ESP_LOG_INFO);
@@ -1527,11 +1563,11 @@ static void core_1_initializer(void* args) {
     // --- GPTimer / Debounce Timer ---
     #pragma region
     ESP_LOGI(MAIN_TAG, "Initializing GPTimer peripheral for debouncing");
-    gptimer_handle_t* timer_handle = malloc(sizeof(gptimer_handle_t));  // needed to be malloc'd!!
-    if (timer_handle == NULL) {
-        ESP_LOGE(MAIN_TAG, "No memory for debounce gptimer handle!");
-        return; // will cause an abort because tasks aren't supposed to return!
-    }
+    // gptimer_handle_t* timer_handle = malloc(sizeof(gptimer_handle_t));  // needed to be malloc'd!!
+    // if (debounce_timer == NULL) {
+    //     ESP_LOGE(MAIN_TAG, "No memory for debounce gptimer handle!");
+    //     return; // will cause an abort because tasks aren't supposed to return!
+    // }
     gptimer_config_t timer_conf = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
@@ -1540,20 +1576,20 @@ static void core_1_initializer(void* args) {
         // .flags.intr_shared
     };
     
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_conf, timer_handle));
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_conf, &debounce_timer));
     // setup the alarm for timer
     gptimer_alarm_config_t timer_alarm_conf = {
         .alarm_count = DEBOUNCE_TIME_MS*10,   // time in ms * 10ticks/ms
         .reload_count = 0,
         .flags.auto_reload_on_alarm = true   // reloads alarm to reload count immediately after alarm. Will do this in ISR
     };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(*timer_handle, &timer_alarm_conf));
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(debounce_timer, &timer_alarm_conf));
     // callback function
     gptimer_event_callbacks_t timer_cbs_conf =  {
         .on_alarm = on_debounce_alarm,
     };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(*timer_handle, &timer_cbs_conf, (void*)timer_handle));
-    ESP_ERROR_CHECK(gptimer_enable(*timer_handle));
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(debounce_timer, &timer_cbs_conf, (void*)&debounce_timer));
+    ESP_ERROR_CHECK(gptimer_enable(debounce_timer));
     ESP_LOGI(MAIN_TAG, "Debounce timer initialized and enabled");
     #pragma endregion
     // --- GPTimers for pulse segments and duration/period
@@ -1596,14 +1632,14 @@ static void core_1_initializer(void* args) {
     ESP_ERROR_CHECK(ret);
     #pragma endregion
     // before function terminates, update my_handles over to main.
-    handles->gptimer = timer_handle;    // these are pointers, so the memory is allocated by the called functions.
+    handles->gptimer = &debounce_timer;    // these are pointers, so the memory is allocated by the called functions.
     handles->card = card;
 
     // here to try and solve a problem, but it isn't the cause of the problem!
     ESP_LOGI(MAIN_TAG, "Installing GPIO ISRs, then creating tasks");
     ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT));    //enable ISRs to be added.
     // Install GPIO ISRs
-    gpio_isr_handler_add(START_BUT, start_isr_handler, (void*)&handles);
+    gpio_isr_handler_add(START_BUT, start_isr_handler, (void*)&handles);    // handle's arg not really needed!
     gpio_isr_handler_add(AUX_BUT, aux_isr_handler, (void*)&handles);
     gpio_isr_handler_add(ROTARY_SWITCH, rot_switch_isr_handler, (void*)(handles->gptimer));
 
