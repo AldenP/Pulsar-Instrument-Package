@@ -513,9 +513,9 @@ static void IRAM_ATTR start_isr_handler(void* arg) {
     // adc_continuous_handle_t *adc_handle = handles->adc_handle;
     // debounce scheme first.
     gptimer_handle_t *t_handle = handles->gptimer;
-    // gpio_intr_disable(START_BUT);   // logical error: had wrong GPIO tag
+    gpio_intr_disable(START_BUT);   // logical error: had wrong GPIO tag
     // gptimer_set_raw_count(*t_handle, 0);
-    // gptimer_start(*t_handle);
+    gptimer_start(*t_handle);
 
     // provide visual output of pressing button.
     led_state = !led_state;
@@ -536,9 +536,9 @@ static void IRAM_ATTR aux_isr_handler(void* arg) {
         return;
     }   // else continue to debounce
     gptimer_handle_t *t_handle = ((my_handlers_t*)arg)->gptimer;
-    // gpio_intr_disable(AUX_BUT); // also had logical error (had ROTARY_SWITCH instead)
+    gpio_intr_disable(AUX_BUT); // also had logical error (had ROTARY_SWITCH instead)
     // gptimer_set_raw_count(*t_handle, 0);
-    // gptimer_start(*t_handle);
+    gptimer_start(*t_handle);
     // provide visual output of button press
     led_state = !led_state;
     gpio_set_level(GREEN_LED, led_state);   // to be ISR/IRAM safe, check config editor under GPIO.
@@ -562,9 +562,9 @@ static void IRAM_ATTR rot_switch_isr_handler(void* args) {
     gpio_set_level(GREEN_LED, led_state);   // visually indicated button push registered
     // debounce scheme first. (seems to need a long timer. )
     gptimer_handle_t *t_handle = (gptimer_handle_t*) args;  //get timer handle from args
-    // gpio_intr_disable(ROTARY_SWITCH);   // prevent other interrupts
+    gpio_intr_disable(ROTARY_SWITCH);   // prevent other interrupts
     // gptimer_set_raw_count(*t_handle, 0);
-    // gptimer_start(*t_handle);
+    gptimer_start(*t_handle);
     
     // now update position
     // if on pupil imaging menu, pressing dial will change it's state
@@ -605,7 +605,7 @@ static bool IRAM_ATTR on_counter_watch(pcnt_unit_handle_t unit, const pcnt_watch
 }
 static bool IRAM_ATTR on_debounce_alarm(gptimer_handle_t handle, const gptimer_alarm_event_data_t *edata, void* user_data) {
     // re-enable button interrupts, after stopping the timer
-    ESP_ERROR_CHECK(gptimer_stop((gptimer_handle_t)user_data));
+    ESP_ERROR_CHECK(gptimer_stop(handle));
     gpio_intr_enable(ROTARY_SWITCH);
     gpio_intr_enable(START_BUT);
     gpio_intr_enable(AUX_BUT);
@@ -1527,7 +1527,11 @@ static void core_1_initializer(void* args) {
     // --- GPTimer / Debounce Timer ---
     #pragma region
     ESP_LOGI(MAIN_TAG, "Initializing GPTimer peripheral for debouncing");
-    gptimer_handle_t timer_handle = NULL;
+    gptimer_handle_t* timer_handle = malloc(sizeof(gptimer_handle_t));  // needed to be malloc'd!!
+    if (timer_handle == NULL) {
+        ESP_LOGE(MAIN_TAG, "No memory for debounce gptimer handle!");
+        return; // will cause an abort because tasks aren't supposed to return!
+    }
     gptimer_config_t timer_conf = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
@@ -1536,20 +1540,20 @@ static void core_1_initializer(void* args) {
         // .flags.intr_shared
     };
     
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_conf, &timer_handle));
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_conf, timer_handle));
     // setup the alarm for timer
     gptimer_alarm_config_t timer_alarm_conf = {
         .alarm_count = DEBOUNCE_TIME_MS*10,   // time in ms * 10ticks/ms
         .reload_count = 0,
         .flags.auto_reload_on_alarm = true   // reloads alarm to reload count immediately after alarm. Will do this in ISR
     };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(timer_handle, &timer_alarm_conf));
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(*timer_handle, &timer_alarm_conf));
     // callback function
     gptimer_event_callbacks_t timer_cbs_conf =  {
         .on_alarm = on_debounce_alarm,
     };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timer_handle, &timer_cbs_conf, (void*)timer_handle));
-    ESP_ERROR_CHECK(gptimer_enable(timer_handle));
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(*timer_handle, &timer_cbs_conf, (void*)timer_handle));
+    ESP_ERROR_CHECK(gptimer_enable(*timer_handle));
     ESP_LOGI(MAIN_TAG, "Debounce timer initialized and enabled");
     #pragma endregion
     // --- GPTimers for pulse segments and duration/period
@@ -1567,7 +1571,7 @@ static void core_1_initializer(void* args) {
     ESP_ERROR_CHECK(gptimer_new_timer(&timer_conf, &segment_timer));
     // Adjust params for duration timer
     timer_conf.intr_priority = 1;   // change resolution? 
-    timer_conf.resolution_hz = 10000;   // 10kHz
+    timer_conf.resolution_hz = 10000;   // 10kHz    may want more resolution to know the time? 
     ESP_ERROR_CHECK(gptimer_new_timer(&timer_conf, &duration_timer));
     // alarm config must wait until sample duration and frequency are known!
     // but we can do callbacks now!
@@ -1594,6 +1598,15 @@ static void core_1_initializer(void* args) {
     // before function terminates, update my_handles over to main.
     handles->gptimer = timer_handle;    // these are pointers, so the memory is allocated by the called functions.
     handles->card = card;
+
+    // here to try and solve a problem, but it isn't the cause of the problem!
+    ESP_LOGI(MAIN_TAG, "Installing GPIO ISRs, then creating tasks");
+    ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT));    //enable ISRs to be added.
+    // Install GPIO ISRs
+    gpio_isr_handler_add(START_BUT, start_isr_handler, (void*)&handles);
+    gpio_isr_handler_add(AUX_BUT, aux_isr_handler, (void*)&handles);
+    gpio_isr_handler_add(ROTARY_SWITCH, rot_switch_isr_handler, (void*)(handles->gptimer));
+
     vTaskResume(main_task_handle);
     vTaskDelete(NULL);  // remove this task to free resources
 }
@@ -1639,7 +1652,6 @@ void app_main(void) {
     gpio_set_level(BLUE_LED, 0);
     gpio_set_level(SD_LED, 0);
     
-    ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT));    //enable ISRs to be added.
     // ----------
     // --- GPTimer / Debounce Timer --- moved
     #pragma region
@@ -2115,11 +2127,11 @@ void app_main(void) {
     vTaskSuspend(NULL); // core_1 will resume this task
     sdmmc_card_t* card = handles.card;   // get card after it is initialized by core1 initializer
 
-    ESP_LOGI(MAIN_TAG, "Installing GPIO ISRs, then creating tasks");
-    // Install GPIO ISRs
-    gpio_isr_handler_add(START_BUT, start_isr_handler, (void*)&handles);
-    gpio_isr_handler_add(AUX_BUT, aux_isr_handler, (void*)&handles);
-    gpio_isr_handler_add(ROTARY_SWITCH, rot_switch_isr_handler, (void*)(handles.gptimer));
+    // ESP_LOGI(MAIN_TAG, "Installing GPIO ISRs, then creating tasks");
+    // // Install GPIO ISRs
+    // gpio_isr_handler_add(START_BUT, start_isr_handler, (void*)&handles);
+    // gpio_isr_handler_add(AUX_BUT, aux_isr_handler, (void*)&handles);
+    // gpio_isr_handler_add(ROTARY_SWITCH, rot_switch_isr_handler, (void*)(handles.gptimer));
 
     // check where ISR ended up
     ESP_LOGI(MAIN_TAG, "Dumping interrupts");
@@ -2240,6 +2252,7 @@ void app_main(void) {
     esp_vfs_fat_sdcard_unmount(mount_point, card_handle);
     ESP_LOGI(MAIN_TAG, "Card unmounted");
 #endif
+    free(handles.gptimer);
     lcd1602_deinit(lcd_ctx);
     ESP_LOGI(MAIN_TAG, "LCD deinitialized");
     nvs_close(my_nvs_handle);
