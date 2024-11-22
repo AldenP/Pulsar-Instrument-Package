@@ -232,6 +232,21 @@ def plot_pcnt_data(time_data: array, pcnt_data: dict[int, array], sample_frequen
     plt.pause(0.001)    # give plot time to update
     plt.ioff            # disable interactive mode
     
+def plot_adc_data(big_data: dict[int, array], sample_frequency: int):
+    """Plots ADC data for all channels."""
+    plt.figure(figsize=(12, 8))
+    time_points = np.arange(0, len(next(iter(big_data.values())))) / sample_frequency
+
+    for channel, data in big_data.items():
+        plt.plot(time_points, data, label=f"Channel {channel}")
+
+    plt.title("ADC Data")
+    plt.xlabel("Time (s)")
+    plt.ylabel("ADC Value (Voltage or Raw)")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
 def plot_adc_data_thread():
     """Thread for plotting ADC data."""
     plt.ion()  # Enable interactive plotting
@@ -375,10 +390,10 @@ while True:
         # adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values  
         # #TODO: update names of variables! 
         pcnt_data = read_pcnt_data()  # read line by line, use delay on MCU time
-        # for now, plot data here
-        # plot_pcnt_data(pcnt_data[0], pcnt_data[1], sample_freq) # potentially put in separate thread so monitoring can continue
+        
         # Send the PCNT data to the plotting thread
-        pcnt_plot_queue.put((pcnt_data[0], pcnt_data[1], sample_freq))
+        # pcnt_plot_queue.put((pcnt_data[0], pcnt_data[1], sample_freq))
+        
         # export data to a file
         # save data for later use.
         curTime = time.localtime()
@@ -401,8 +416,9 @@ while True:
                 fd.write(str(pcnt_data[1][ch]))
                 # alternatively, array can be saved to a binary file with .tofile(fd), and then read using .fromfile(fd, # to read)
                 print("PY > file created: ", fileName)
-        # loopCompletions += 1
-        # adc_data.append(adc_data_partial)
+        # for now, plot data here
+        plot_pcnt_data(pcnt_data[0], pcnt_data[1], sample_freq) # potentially put in separate thread so monitoring can continue
+
     elif dataIn.strip() == BEGIN_ADC_TAG:
         adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values  
         loopCompletions += 1
@@ -422,8 +438,8 @@ while True:
                 big_data[chNum].extend(adc_data[i][chNum])  #extend appends all elements of iterable to the end of original array.
 
         # Send ADC data to the plotting thread
-        adc_plot_queue.put((big_data, sample_freq))
-
+        # adc_plot_queue.put((big_data, sample_freq))
+        
         # save data for later use.
         curTime = time.localtime()
         # YYYYDDMM_hhmmss
@@ -444,6 +460,8 @@ while True:
                 # alternatively, array can be saved to a binary file with .tofile(fd), and then read using .fromfile(fd, # to read)
                 print("PY > file created: ", fileName)
         
+        plot_adc_data(big_data, sample_freq)
+
         loopCompletions = 0 # reset loop counter 
         total_read = 0
     else:
