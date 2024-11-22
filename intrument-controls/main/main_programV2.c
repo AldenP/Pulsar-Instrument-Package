@@ -61,7 +61,7 @@
 #define SD_DAT3         GPIO_NUM_13     // orange wire
 // - SD Params -
 #define SD_LINE_WIDTH   4               // want 4-line/bit width, but doesn't work, so 1-line it is (for now)
-#define SD_FREQUENCY    SDMMC_FREQ_HIGHSPEED    // 40MHz fastest, default is 20MHz, and probing (slowest) is 400kHz
+#define SD_FREQUENCY    SDMMC_FREQ_DEFAULT    // 40MHz fastest, default is 20MHz, and probing (slowest) is 400kHz
 // --- LEDs ---
 #define GREEN_LED       GPIO_NUM_0      // General debug LED (button presses)
 #define RED_LED         GPIO_NUM_5      // ADC on/off status LED
@@ -173,7 +173,7 @@ static const char* SD_TAG = "SD-TRANSFER";
 static const char* NVS_TAG = "NVS";
 #pragma endregion
 
-static const char * PY_TAG = "BEGIN PY READ";       // begin reading a segment of ADC_BUFFER_LEN
+static const char * PY_TAG = "BEGIN ADC READ";       // begin reading a segment of ADC_BUFFER_LEN
 static const char * PY_END_TAG = "END PY SAMPLE";   // tag to save partial segments into 1 file 
 static const char * PY_DATA = "PY METADATA";        // tag to tell python here is metadata (sample frequency and duration)
 
@@ -1080,7 +1080,7 @@ static void adc_transfer_task(void* args) {
             // use printf, or write to uart directly (as binary)? Will there ever be a time when there is less actual data in a sector?
             // use printf, because we want to extract the data properly from the result_buf
             printf("%s\n", PY_TAG);   // display tag for Python.
-            printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read (bytes)
+            printf("Number of lines: %"PRIu32"\n", ret_num / 2);    //pass over number of bytes/lines to read (bytes)
             // Loop runs 8196 times (so 8196 lines to read in)
             for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
                 adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result_buf[i];

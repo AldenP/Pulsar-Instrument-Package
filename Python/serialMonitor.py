@@ -35,7 +35,7 @@ DEFAULT_DIR = "./pcnt_data/"
 
 # The serial object for communicating with MCU
 ser : serial.Serial = serial.Serial(serial_port, baud_rate, timeout=5)  # 5 second timeout on reads
-ser.set_buffer_size(80*1024, None)  # set a buffer size to read from
+ser.set_buffer_size(128*1024, None)  # set a buffer size to read from
 
 # Parameters and debug variables
 sample_freq :int = 0
@@ -44,12 +44,16 @@ loopCompletions :int = 0
 total_read :int = 0
 
 input_queue = queue.Queue()  # Queue to store user commands
+adc_plot_queue = queue.Queue()  # Queue for ADC data to be plotted
+pcnt_plot_queue = queue.Queue()  # Queue for PCNT data to be plotted
 
 def read_adc_data() -> dict[int, array]:
     global loopCompletions
     global total_read
     print("PY > Reading ADC Data\n")
     adc_raw :dict[int, array] = dict()  # stores channel as key, and list (or better, an array) as value (data) (or np array)
+    for i in range(4):
+        adc_raw[i] = array('f')
     # printf("Number of Bytes: %"PRIu32"\n", ret_num);    //pass over number of bytes/lines to read
     line = ser.readline()
     print("PY > " + str(line.strip(), "utf-8"))
@@ -71,9 +75,9 @@ def read_adc_data() -> dict[int, array]:
             chNum = int(lineS[0].strip(), base=10)
             # val_raw = int(lineS[1].split(b':')[1].strip(), base=16)  #value is hex.
             val_raw = int(lineS[1].strip(), base=16)
-            if chNum not in adc_raw:   #make array for dictionary if key hasn't been entered
-                # first = False
-                adc_raw[chNum] = array('f')    #'H' is for unsigned integer, which is 2 bytes (16bit). 'f'=float
+            # if chNum not in adc_raw:   #make array for dictionary if key hasn't been entered
+            #     # first = False
+            #     adc_raw[chNum] = array('f')    #'H' is for unsigned integer, which is 2 bytes (16bit). 'f'=float
             val_mV = val_raw * VMAX / DMAX      # Convert raw value to voltage
             adc_raw[chNum].append(val_mV)  #append works with array.
             total_read += 2
@@ -83,7 +87,8 @@ def read_adc_data() -> dict[int, array]:
         except ValueError:
             print("<read_adc_data> Error reading a value from serial data in")  
             print(f"This line of data: \"{str(line, encoding="utf-8")}\"")
-            print(f"Value of loop iterator {i=} of {numLines=}; {loopCompletions=}; {total_read=}")
+            print(f"Value of loop iterator {i=} of {numLines=}; {loopCompletions=}; {total_read=} B")
+            continue
             exit(-1)
         except Exception as err:
             print(f"Unexpected Error: {err}\nType: {type(err)}")
@@ -227,6 +232,64 @@ def plot_pcnt_data(time_data: array, pcnt_data: dict[int, array], sample_frequen
     plt.pause(0.001)    # give plot time to update
     plt.ioff            # disable interactive mode
     
+def plot_adc_data_thread():
+    """Thread for plotting ADC data."""
+    plt.ion()  # Enable interactive plotting
+    fig, ax = plt.subplots(figsize=(10, 6))
+    lines = {}  # Store line objects for each channel
+    ax.set_title("ADC Data Over Time")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Voltage (mV)")
+    ax.grid(True)
+
+    while True:
+        if not adc_plot_queue.empty():
+            adc_data, sample_frequency = adc_plot_queue.get()
+
+            # Prepare time axis
+            num_samples = len(next(iter(adc_data.values())))
+            time_axis = np.linspace(0, num_samples / sample_frequency, num_samples)
+
+            # Plot data
+            for ch, data in adc_data.items():
+                if ch not in lines:
+                    lines[ch], = ax.plot([], [], label=f"Channel {ch}")
+                lines[ch].set_data(time_axis, data)
+
+            # Update plot limits and redraw
+            ax.set_xlim([0, time_axis[-1]])
+            ax.set_ylim([0, VMAX])
+            ax.legend()
+            plt.draw()
+            plt.pause(0.001)
+
+def plot_pcnt_data_thread():
+    """Thread for plotting PCNT data."""
+    plt.ion()  # Enable interactive plotting
+    fig, ax = plt.subplots(figsize=(10, 6))
+    lines = {}  # Store line objects for each channel
+    ax.set_title("Pulse Counts Over Time")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Pulse Count")
+    ax.grid(True)
+
+    while True:
+        if not pcnt_plot_queue.empty():
+            time_data, pcnt_data, sample_frequency = pcnt_plot_queue.get()
+
+            time_in_seconds = np.array(time_data) * 1e-4  # Convert time data to seconds
+
+            for ch, data in pcnt_data.items():
+                if ch not in lines:
+                    lines[ch], = ax.plot([], [], label=f"Channel {ch}")
+                lines[ch].set_data(time_in_seconds, data)
+
+            ax.set_xlim([0, time_in_seconds[-1]])
+            ax.set_ylim([0, max(max(data) for data in pcnt_data.values())])
+            ax.legend()
+            plt.draw()
+            plt.pause(0.001)
+
 # New function to handle user input and display help
 def send_user_commands():
     """Handles user input commands asynchronously."""
@@ -279,6 +342,14 @@ user_command_thread = threading.Thread(target=send_user_commands)
 user_command_thread.daemon = True
 user_command_thread.start()
 
+plot_adc_thread = threading.Thread(target=plot_adc_data_thread)
+plot_adc_thread.daemon = True
+# plot_adc_thread.start()
+
+plot_pcnt_thread = threading.Thread(target=plot_pcnt_data_thread)
+plot_pcnt_thread.daemon = True
+# plot_pcnt_thread.start()
+
 # main loop / thread
 # wait until a tag appears (like 'py_adc_read') to appear and then start reading the data from adc.
 while True:
@@ -305,7 +376,9 @@ while True:
         # #TODO: update names of variables! 
         pcnt_data = read_pcnt_data()  # read line by line, use delay on MCU time
         # for now, plot data here
-        plot_pcnt_data(pcnt_data[0], pcnt_data[1], sample_freq) # potentially put in separate thread so monitoring can continue
+        # plot_pcnt_data(pcnt_data[0], pcnt_data[1], sample_freq) # potentially put in separate thread so monitoring can continue
+        # Send the PCNT data to the plotting thread
+        pcnt_plot_queue.put((pcnt_data[0], pcnt_data[1], sample_freq))
         # export data to a file
         # save data for later use.
         curTime = time.localtime()
@@ -347,6 +420,9 @@ while True:
         for i in range(1, len(adc_data)):
             for chNum in big_data:
                 big_data[chNum].extend(adc_data[i][chNum])  #extend appends all elements of iterable to the end of original array.
+
+        # Send ADC data to the plotting thread
+        adc_plot_queue.put((big_data, sample_freq))
 
         # save data for later use.
         curTime = time.localtime()
