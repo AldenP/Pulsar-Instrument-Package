@@ -23,7 +23,8 @@ chunk_size: int = 8*1024 * 7    # How much data Python will read at once as a ch
 BEGIN_TAG = b"BEGIN PY READ"    # 'b' is to interpret as binary
 END_TAG = b"END PY READ"        # if the end of a chunk needs to be labeled.
 PY_END_TAG = b"END PY SAMPLE"
-PY_ADC_END_TAG = b"END ADC SAMPLE"
+BEGIN_ADC_TAG = b"BEGIN ADC READ"   # for portability to accept both ADC and PCNT versions of the MCU code.
+# PY_ADC_END_TAG = b"END ADC SAMPLE"
 META_TAG = b"PY METADATA"       # Used to send meta data information
 
 PY_TAG = "PY>\t"    # something to preface python prints to distinuish from MCU data in.
@@ -206,6 +207,7 @@ def plot_pcnt_data(time_data: array, pcnt_data: dict[int, array], sample_frequen
         channel_pulse_diffs[ch] = pulse_diffs
 
     # Plot data for each channel
+    plt.ion()   # interactive mode
     plt.figure(figsize=(10, 6))
     for ch in range(4):
         plt.plot(
@@ -221,6 +223,9 @@ def plot_pcnt_data(time_data: array, pcnt_data: dict[int, array], sample_frequen
     plt.legend()
     plt.grid(True)
     plt.show()
+
+    plt.pause(0.001)    # give plot time to update
+    plt.ioff            # disable interactive mode
     
 # New function to handle user input and display help
 def send_user_commands():
@@ -325,13 +330,17 @@ while True:
                 print("PY > file created: ", fileName)
         # loopCompletions += 1
         # adc_data.append(adc_data_partial)
+    elif dataIn.strip() == BEGIN_ADC_TAG:
+        adc_data_partial = read_adc_data()  #returns a dictionary of chNum->list of values  
+        loopCompletions += 1
+        adc_data.append(adc_data_partial)
+  
+    # elif dataIn.strip() == PY_END_TAG:    #PCNT doesn't need an ending tag
+    #     # export data to file
+    #     print(PY_TAG, "Sample end not implemented")
+    #     pass
 
     elif dataIn.strip() == PY_END_TAG:
-        # export data to file
-        print(PY_TAG, "Sample end not implemented")
-        pass
-
-    elif dataIn.strip() == PY_ADC_END_TAG:
         # export the list of dictionaries into one large dictionary (of chNum->array of data)
         # other way to store data: 2D array of chNum and time or cycles. 
         big_data = adc_data[0]  #should be a dictionary  
