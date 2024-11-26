@@ -5,10 +5,8 @@ Part of a Senior Design Project at UCF during the Summer 2024 and Fall 2024 seme
 
 ## List of Functionality
 The following lists the basic functionality that the package provides:
-- Takes extracted data and calculates the Pulse Timing of a Pulsar
-- Takes extracted data and calculates the Polarization of a Pulsar
-
-On the embedded side:
+- Extracts data from the MCU, saves it, and plots it
+(On the embedded side:)
 - Handle user input via physical buttons
 - Adjust the sampling rate, and sample duration based on user input
 - Count the number of pulses per sample period, for the duration and frequency set by user
