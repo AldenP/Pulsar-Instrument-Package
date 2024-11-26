@@ -5,15 +5,17 @@ body {
     background-repeat: no-repeat;
     background-size: auto;
 }
-h1 {
+h1, h2, h3 {
     font-family: 'Times New Roman', Times, serif;
     /* padding: 10px; */
-    padding-left:10px;
-    
+    /* padding-left:10px; */
+    margin-left: 2%;
+    margin-right: 2%;
 }
 p {
     font-family: 'Trebuchet MS';
-    margin: 8px 20px;
+    /* margin: 8px 20px; */
+    margin-left: 5%;
 }
 .list {
     font-family :'Trebuchet MS';
@@ -101,13 +103,22 @@ p {
     border-left: 2px solid steelblue;
 
 }
+/* Main docs list */
+#main_docs {
+    list-style-type: none;
+    font-family: 'Trebuchet MS', 'Lucida Sans Unicode', 'Lucida Grande', 'Lucida Sans', Arial, sans-serif;
+}
+.docsLI {
+    padding: 5px;
+    font-family: 'Trebuchet MS', sans-serif;
+}
 /* Horizontal Navigation Bar Classes and Styles */
 .navBar {
     margin: 5px;
     padding: 5px;
     /* border-radius: 10px; */
-    border-style: groove; 
-    border-width: 3px;
+    /* border-style: groove;  */
+    /* border-width: 3px; */
 }
 .navBarList {   /* an instance of <ul>*/
     list-style-type: none;
