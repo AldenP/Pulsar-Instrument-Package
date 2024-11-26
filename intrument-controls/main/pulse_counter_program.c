@@ -69,8 +69,8 @@
 #define SD_DAT2         GPIO_NUM_12     // yellow wire
 #define SD_DAT3         GPIO_NUM_13     // orange wire
 // - SD Params -
-#define SD_LINE_WIDTH   4               // want 4-line/bit width, but doesn't work, so 1-line it is (for now)
-#define SD_FREQUENCY    SDMMC_FREQ_DEFAULT    // 40MHz fastest, default is 20MHz, and probing (slowest) is 400kHz
+#define SD_LINE_WIDTH   1             // want 4-line/bit width, but doesn't work, so 1-line it is (for now)
+#define SD_FREQUENCY    SDMMC_FREQ_HIGHSPEED    // 40MHz fastest, default is 20MHz, and probing (slowest) is 400kHz
     // problem with SD card could be impedence mismatching
 // --- LEDs ---
 #define GREEN_LED       GPIO_NUM_0      // General debug LED (button presses)
@@ -457,7 +457,7 @@ void init_sd_config(sdmmc_host_t *out_host, sdmmc_slot_config_t *out_slot_config
     // TODO: add card detect (CD)
     slot_config.gpio_cd = SD_DETECT;
     // Set bus width to use:
-    slot_config.width = 4;
+    slot_config.width = SD_LINE_WIDTH;  
 
     // Enable internal pullups on enabled pins. The internal pullups
     // are insufficient however, please make sure 10k external pullups are
@@ -711,7 +711,8 @@ static void sample_start_task(void* args) {
         // --- anything else?
         
         suppress_logs(ESP_LOG_INFO);    // suppress the logs!
-        // esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_DEBUG);
+        esp_log_level_set(START_TASK_TAG, ESP_LOG_DEBUG);
+        esp_log_level_set(SAMPLE_COPY_TAG, ESP_LOG_DEBUG);
         esp_log_level_set(TRANSFER_TAG, ESP_LOG_DEBUG);
 
         ESP_LOGI(START_TASK_TAG, "Clearing PCNT counts...");
@@ -899,7 +900,7 @@ static void sample_copy_task(void* args) {
         ESP_LOGD(SAMPLE_COPY_TAG, "Copy task waiting for notification from timer...");
         // configTASK_NOTIFICATION_ARRAY_ENTRIES    // hmm, it equals 1, so only 0 is valid? Requires different solution I guess. 
         if (ulTaskNotifyTake(pdTRUE, 1000/portTICK_PERIOD_MS) ) {
-            ESP_LOGD(SAMPLE_COPY_TAG, "Getting data to store");
+            // ESP_LOGD(SAMPLE_COPY_TAG, "Getting data to store");
             int32_t pulse_counts[4] = {0};
             ESP_ERROR_CHECK(pcnt_unit_get_count(counter_handle1, &pulse_counts[0]));
             ESP_ERROR_CHECK(pcnt_unit_get_count(counter_handle2, &pulse_counts[1]));
@@ -908,8 +909,8 @@ static void sample_copy_task(void* args) {
             
             uint64_t time = 0;
             ESP_ERROR_CHECK(gptimer_get_raw_count(duration_timer, &time));    
-            ESP_LOGD(SAMPLE_COPY_TAG, "Counts: %lu, %lu, %lu, %lu; Time: %llu", pulse_counts[0], pulse_counts[1],
-                pulse_counts[2],pulse_counts[3], time); // verify what data comes in. 
+            // ESP_LOGD(SAMPLE_COPY_TAG, "Counts: %lu, %lu, %lu, %lu; Time: %llu", pulse_counts[0], pulse_counts[1],
+                // pulse_counts[2],pulse_counts[3], time); // verify what data comes in. 
             // pulse_data data = { 
             //     .counts = {
             //         pulse_counts[0],
@@ -1073,7 +1074,7 @@ static void sample_transfer_task(void* args) {
             free(tmp_buf);  // just in case
             continue;
         }
-        
+        suppress_logs(ESP_LOG_WARN);
         // Send sample metadata to python
         printf("%s\nfreq: %"PRIu32"; duration: %"PRIu32"\n", PY_DATA, sample_frequency, sample_duration);
                 
@@ -1095,6 +1096,8 @@ static void sample_transfer_task(void* args) {
 
         // determine the number of loop iterations (to get data in a single function within Python)
         size_t iterations = num_sectors / buffer_sector_size + 1;
+        if (end_idx == 0)
+            iterations -= 1;    // the plus one causes problems when end_idx is zero.
         // send to Python
         printf("%s\nIterations: %u\n", PY_TAG, iterations);
 
@@ -1145,6 +1148,9 @@ static void sample_transfer_task(void* args) {
             // sectors_to_read -= sectors_to_read;  // unnecessary, not in loop
             vTaskDelay(10/portTICK_PERIOD_MS);  // give python 10ms to catchup
         }
+        // if (iterations > 1 && end_idx == 0) {
+        //     printf("Num lines: 0\n");   // no more lines left, must print this for python.
+        // }
 
         // tell python number of loops, and how much per loop? 
         // for (size_t transferred = 0; transferred < num_sectors; transferred += step_sectors) {
@@ -1193,6 +1199,7 @@ static void sample_transfer_task(void* args) {
             // free(tmp_buf);
             // continue;
         }
+        unsuppress_logs(ESP_LOG_DEBUG);
         // done reading data
         free(tmp_buf);  // release buffer, not needed until next time.
         vTaskResume(start_task_handle);
